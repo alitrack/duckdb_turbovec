@@ -4,34 +4,40 @@ use arrow::{
 };
 use duckdb::{
     core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
-    duckdb_entrypoint_c_api,
     vtab::{
         arrow::record_batch_to_duckdb_data_chunk,
         BindInfo, InitInfo, TableFunctionInfo, VTab,
     },
     Connection, Result,
 };
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{Arc, Mutex, OnceLock},
+};
 use turbovec::TurboQuantIndex;
 
-/// Per-scan state: loaded index + search results.
+// ── Global: raw DuckDB database handle (captured at LOAD time) ──
+static RAW_DB: OnceLock<ffi::duckdb_database> = OnceLock::new();
+
+/// Get a temporary Connection from the raw handle (VTab callbacks can use this).
+fn temp_conn() -> duckdb::Result<Connection> {
+    let raw = RAW_DB.get().expect("RAW_DB not initialized — extension not loaded properly");
+    unsafe { Connection::open_from_raw(*raw) }
+}
+
+/// Search results cache.
 #[repr(C)]
 struct SearchInitData {
     done: std::sync::atomic::AtomicBool,
 }
 
-/// Bound parameters stored for func() access.
 #[repr(C)]
 struct SearchBindData {
-    index_path: String,
-    query: Vec<f32>,
-    k: usize,
-    /// Search results: rows of (idx: i32, score: f32).
     results: Vec<(i32, f32)>,
-    /// Output schema for Arrow batch construction.
     schema: Arc<arrow::datatypes::Schema>,
 }
 
+// ── turboquant_search(index_path, query_str, k) ──
 struct TurboQuantSearchVTab;
 
 impl VTab for TurboQuantSearchVTab {
@@ -39,71 +45,38 @@ impl VTab for TurboQuantSearchVTab {
     type InitData = SearchInitData;
 
     fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        let param_count = bind.get_parameter_count();
-        if param_count < 3 {
-            return Err(format!(
-                "turboquant_search: expected 3 params (path, query::FLOAT[N], k), got {param_count}"
-            )
-            .into());
+        let pc = bind.get_parameter_count();
+        if pc < 3 {
+            return Err("turboquant_search: expected 3 params (path, query_str, k)".into());
         }
+        let path = bind.get_parameter(0).to_string();
+        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
+        let k: usize = bind.get_parameter(2).to_string().parse()?;
 
-        let index_path = bind.get_parameter(0).to_string();
+        let idx = TurboQuantIndex::load(&path)
+            .map_err(|e| format!("turboquant_search: {e}"))?;
+        let sr = idx.search(&query, k);
 
-        let query_str = bind.get_parameter(1).to_string();
-        let query = parse_float_array(&query_str)?;
-
-        let k: usize = bind
-            .get_parameter(2)
-            .to_string()
-            .parse()
-            .map_err(|e| format!("turboquant_search: invalid k: {e}"))?;
-
-        // Load index and run search eagerly in bind
-        let index = TurboQuantIndex::load(&index_path)
-            .map_err(|e| format!("turboquant_search: cannot load '{index_path}': {e}"))?;
-
-        let sr = index.search(&query, k);
-
-        // Flatten results: one query, k results
         let mut results = Vec::with_capacity(sr.nq * k);
         for qi in 0..sr.nq {
-            let offset = qi * k;
+            let off = qi * k;
             for j in 0..k {
-                let idx = sr.indices[offset + j] as i32;
-                let score = sr.scores[offset + j];
-                results.push((idx, score));
+                results.push((sr.indices[off + j] as i32, sr.scores[off + j]));
             }
         }
 
-        // Declare output schema
         let schema = Arc::new(Schema::new(vec![
             Field::new("idx", DataType::Int32, false),
             Field::new("score", DataType::Float32, false),
         ]));
+        bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
 
-        // Register output columns with DuckDB
-        bind.add_result_column(
-            "idx",
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-        );
-        bind.add_result_column(
-            "score",
-            LogicalTypeHandle::from(LogicalTypeId::Float),
-        );
-
-        Ok(SearchBindData {
-            index_path,
-            query,
-            k,
-            results,
-            schema,
-        })
+        Ok(SearchBindData { results, schema })
     }
 
-    fn init(_info: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
-        Ok(SearchInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(SearchInitData { done: false.into() })
     }
 
     fn func(
@@ -111,25 +84,20 @@ impl VTab for TurboQuantSearchVTab {
         output: &mut DataChunkHandle,
     ) -> std::result::Result<(), Box<dyn Error>> {
         let init = func.get_init_data();
-        let bind = func.get_bind_data();
-
         if init.done.load(std::sync::atomic::Ordering::Relaxed) {
             output.set_len(0);
             return Ok(());
         }
-
+        let bind = func.get_bind_data();
         let n = bind.results.len().min(2048);
-
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
             return Ok(());
         }
 
-        // Build Arrow RecordBatch from results
         let indices: Vec<i32> = bind.results.iter().take(n).map(|r| r.0).collect();
         let scores: Vec<f32> = bind.results.iter().take(n).map(|r| r.1).collect();
-
         let batch = RecordBatch::try_new(
             bind.schema.clone(),
             vec![
@@ -137,40 +105,168 @@ impl VTab for TurboQuantSearchVTab {
                 Arc::new(Float32Array::from(scores)),
             ],
         )?;
-
         record_batch_to_duckdb_data_chunk(&batch, output)?;
-
         init.done.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // index_path
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // query (FLOAT[N] as string)
-            LogicalTypeHandle::from(LogicalTypeId::Integer), // k
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
         ])
     }
 }
 
-/// Parse a DuckDB float array string like "[1.0, 2.0, 3.0]".
+// ── turboquant_build(table_name, col_name, bit_width, output_path) ──
+// Reads vectors from a DuckDB table, builds a turbovec index, saves to file.
+// Uses the raw DB handle captured at LOAD time.
+struct TurboQuantBuildVTab;
+
+#[repr(C)]
+struct BuildInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+struct BuildBindData {
+    output_path: String,
+    rows: usize,
+}
+
+impl VTab for TurboQuantBuildVTab {
+    type BindData = BuildBindData;
+    type InitData = BuildInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let pc = bind.get_parameter_count();
+        if pc < 4 {
+            return Err("turboquant_build: expected 4 params (table, col, bit_width, output_path)".into());
+        }
+        let table = bind.get_parameter(0).to_string();
+        let col = bind.get_parameter(1).to_string();
+        let bw: usize = bind.get_parameter(2).to_string().parse()?;
+        let output_path = bind.get_parameter(3).to_string();
+
+        // Use temp connection from raw handle to read the table
+        let con = temp_conn()?;
+
+        // Get dimension from first row
+        let dim_sql = format!("SELECT len({col}) FROM {table} LIMIT 1");
+        let dim: usize = con
+            .query_row(&dim_sql, [], |row| row.get::<_, i32>(0))
+            .map_err(|e| format!("turboquant_build: cannot read table '{table}': {e}"))? as usize;
+
+        // Count rows
+        let count_sql = format!("SELECT count(*) FROM {table}");
+        let n: usize = con
+            .query_row(&count_sql, [], |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("turboquant_build: {e}"))? as usize;
+
+        if n == 0 {
+            return Err("turboquant_build: table has no rows".into());
+        }
+
+        // Read all vectors and build index
+        let read_sql = format!("SELECT {col} FROM {table}");
+        let mut stmt = con.prepare(&read_sql)?;
+        let mut rows = stmt.query([])?;
+
+        let mut idx = TurboQuantIndex::new(dim, bw)
+            .map_err(|e| format!("turboquant_build: {e}"))?;
+
+        // Read in batches of 2048
+        let mut batch = Vec::with_capacity(2048 * dim);
+        while let Some(row) = rows.next()? {
+            let vec_str: String = row.get(0)?;
+            let vec = parse_float_array(&vec_str)?;
+            batch.extend_from_slice(&vec);
+            if batch.len() >= 2048 * dim {
+                idx.add(&batch);
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            idx.add(&batch);
+        }
+
+        idx.write(&output_path)
+            .map_err(|e| format!("turboquant_build: cannot write '{output_path}': {e}"))?;
+
+        bind.add_result_column("output_path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("rows", LogicalTypeHandle::from(LogicalTypeId::Integer));
+
+        Ok(BuildBindData { output_path, rows: n })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(BuildInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let bind = func.get_bind_data();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("output_path", DataType::Utf8, false),
+            Field::new("rows", DataType::Int32, false),
+        ]));
+
+        let path_arr = arrow::array::StringArray::from(vec![bind.output_path.as_str()]);
+        let rows_arr = Int32Array::from(vec![bind.rows as i32]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(path_arr), Arc::new(rows_arr)])?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // table
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // column
+            LogicalTypeHandle::from(LogicalTypeId::Integer), // bit_width
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // output_path
+        ])
+    }
+}
+
+// ── Custom entrypoint: capture raw DB handle, then delegate ──
+
+/// The actual init logic (called by the raw entrypoint after capturing the DB handle).
+unsafe fn extension_init(con: Connection) -> Result<(), Box<dyn Error>> {
+    con.register_table_function::<TurboQuantSearchVTab>("turboquant_search")?;
+    con.register_table_function::<TurboQuantBuildVTab>("turboquant_build")?;
+    Ok(())
+}
+
+mod ffi {
+    pub use duckdb::ffi::duckdb_database;
+}
+
+// ── Utilities ──
+
 fn parse_float_array(raw: &str) -> std::result::Result<Vec<f32>, Box<dyn Error>> {
     let cleaned = raw.trim().trim_start_matches('[').trim_end_matches(']');
-    if cleaned.is_empty() {
-        return Ok(Vec::new());
-    }
-    cleaned
-        .split(',')
-        .map(|s| {
-            s.trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid float '{s}': {e}").into())
-        })
+    if cleaned.is_empty() { return Ok(Vec::new()); }
+    cleaned.split(',')
+        .map(|s| s.trim().parse::<f32>().map_err(|e| format!("invalid float '{s}': {e}").into()))
         .collect()
 }
 
-#[duckdb_entrypoint_c_api(ext_name = "turbovec")]
-pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_table_function::<TurboQuantSearchVTab>("turboquant_search")?;
-    Ok(())
+// ── No-std-compatible entrypoint ──
+
+#[no_mangle]
+pub unsafe extern "C" fn turbovec_init_c_api(raw_db: ffi::duckdb_database) {
+    // Capture the raw handle before wrapping
+    RAW_DB.set(raw_db).ok();
+    let con = Connection::open_from_raw(raw_db).unwrap();
+    extension_init(con).unwrap();
 }
