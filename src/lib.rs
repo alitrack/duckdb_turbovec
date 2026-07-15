@@ -12,17 +12,20 @@ use duckdb::{
 };
 use std::{
     error::Error,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, atomic::AtomicPtr},
 };
 use turbovec::TurboQuantIndex;
 
 // ── Global: raw DuckDB database handle (captured at LOAD time) ──
-static RAW_DB: OnceLock<ffi::duckdb_database> = OnceLock::new();
+static RAW_DB: AtomicPtr<ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Get a temporary Connection from the raw handle (VTab callbacks can use this).
 fn temp_conn() -> duckdb::Result<Connection> {
-    let raw = RAW_DB.get().expect("RAW_DB not initialized — extension not loaded properly");
-    unsafe { Connection::open_from_raw(*raw) }
+    let raw = RAW_DB.load(std::sync::atomic::Ordering::Relaxed);
+    if raw.is_null() {
+        panic!("RAW_DB not initialized — extension not loaded properly");
+    }
+    unsafe { Connection::open_from_raw(raw as ffi::duckdb_database) }
 }
 
 /// Search results cache.
@@ -266,7 +269,7 @@ fn parse_float_array(raw: &str) -> std::result::Result<Vec<f32>, Box<dyn Error>>
 #[no_mangle]
 pub unsafe extern "C" fn turbovec_init_c_api(raw_db: ffi::duckdb_database) {
     // Capture the raw handle before wrapping
-    RAW_DB.set(raw_db).ok();
+    RAW_DB.store(raw_db as *mut ffi::c_void, std::sync::atomic::Ordering::Relaxed);
     let con = Connection::open_from_raw(raw_db).unwrap();
     extension_init(con).unwrap();
 }
