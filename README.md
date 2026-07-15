@@ -9,20 +9,14 @@ DuckDB extension for compressed vector search using Google's [TurboQuant](https:
 ```sql
 LOAD 'turbovec.duckdb_extension';
 
--- 1. Build index from a DuckDB table
---    (string_agg serializes vectors; turboquant_build compresses and indexes)
+-- 1. Serialize and build index from a DuckDB table
+--    First get vectors as string, then feed to turboquant_build
 SELECT * FROM turboquant_build(
-    (SELECT string_agg(emb::VARCHAR, ',') FROM documents),
-    1536, 4, '/tmp/myidx.tv'
+    (SELECT string_agg(emb::VARCHAR, ',') FROM documents), 1536, 4, '/tmp/myidx.tv'
 );
--- → (output_path, rows)
 
 -- 2. Search
-SELECT * FROM turboquant_search(
-    '/tmp/myidx.tv',
-    '[0.1, 0.2, ...]',  -- query vector as string
-    10
-);
+SELECT * FROM turboquant_search('/tmp/myidx.tv', '[0.1, 0.2, ...]', 10);
 -- → (idx INT, score FLOAT)
 ```
 
