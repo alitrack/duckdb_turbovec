@@ -38,15 +38,21 @@ SELECT * FROM turboquant_search(
 ```bash
 git clone git@github.com:alitrack/duckdb_turbovec.git && cd duckdb_turbovec
 
-# macOS
+# macOS (uses Accelerate framework)
 cargo build --release
 python3 scripts/metadata.py target/release/libturbovec.dylib -o turbovec.duckdb_extension
 
-# Linux
+# Linux (requires libopenblas-dev)
 sudo apt-get install libopenblas-dev
 cargo build --release
 python3 scripts/metadata.py target/release/libturbovec.so -o turbovec.duckdb_extension
+
+# Windows (no BLAS dependency — turbovec uses pure Rust on Windows)
+cargo build --release
+python3 scripts/metadata.py target/release/turbovec.dll -o turbovec.duckdb_extension
 ```
+
+> **WASM**: Not supported — turbovec requires 64-bit pointer width; WASM is 32-bit.
 
 ## Features
 
