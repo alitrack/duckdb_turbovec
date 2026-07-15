@@ -12,7 +12,8 @@ use duckdb::{
 };
 use std::{
     error::Error,
-    sync::{Arc, atomic::AtomicPtr},
+    ffi::c_void,
+    sync::{atomic::AtomicPtr, Arc},
 };
 use turbovec::TurboQuantIndex;
 
