@@ -12,6 +12,7 @@ use std::{error::Error, sync::Arc};
 use turbovec::TurboQuantIndex;
 
 // ── turboquant_search(index_path, query_str, k) ──
+// Top-k ANN search: returns (idx, score) for the k nearest neighbors.
 
 #[repr(C)]
 struct SearchInitData {
@@ -99,6 +100,103 @@ impl VTab for TurboQuantSearchVTab {
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
             LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+}
+
+// ── turboquant_score(index_path, query_str) ──
+// Returns cosine similarity scores for ALL vectors in the index.
+// Output columns: (idx INT, score FLOAT) ordered by score DESC.
+
+#[repr(C)]
+struct ScoreInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+struct ScoreBindData {
+    results: Vec<(i32, f32)>,
+    schema: Arc<arrow::datatypes::Schema>,
+}
+
+struct TurboQuantScoreVTab;
+
+impl VTab for TurboQuantScoreVTab {
+    type BindData = ScoreBindData;
+    type InitData = ScoreInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let pc = bind.get_parameter_count();
+        if pc < 2 {
+            return Err("turboquant_score: expected 2 params (path, query_str)".into());
+        }
+        let path = bind.get_parameter(0).to_string();
+        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
+
+        let idx = TurboQuantIndex::load(&path)
+            .map_err(|e| format!("turboquant_score: {e}"))?;
+        let n = idx.len();
+        if n == 0 {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("idx", DataType::Int32, false),
+                Field::new("score", DataType::Float32, false),
+            ]));
+            return Ok(ScoreBindData { results: Vec::new(), schema });
+        }
+
+        // search with k=n returns all vectors sorted by score desc
+        let sr = idx.search(&query, n);
+        let results: Vec<(i32, f32)> = (0..n)
+            .map(|j| (sr.indices[j] as i32, sr.scores[j]))
+            .collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("idx", DataType::Int32, false),
+            Field::new("score", DataType::Float32, false),
+        ]));
+        bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
+        Ok(ScoreBindData { results, schema })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(ScoreInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        let bind = func.get_bind_data();
+        let n = bind.results.len().min(2048);
+        if n == 0 {
+            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            output.set_len(0);
+            return Ok(());
+        }
+        let indices: Vec<i32> = bind.results.iter().take(n).map(|r| r.0).collect();
+        let scores: Vec<f32> = bind.results.iter().take(n).map(|r| r.1).collect();
+        let batch = RecordBatch::try_new(
+            bind.schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(indices)),
+                Arc::new(Float32Array::from(scores)),
+            ],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // path
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // query_str
         ])
     }
 }
@@ -277,6 +375,7 @@ fn parse_nested_float_arrays(
 #[duckdb_entrypoint_c_api(ext_name = "turbovec")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<TurboQuantSearchVTab>("turboquant_search")?;
+    con.register_table_function::<TurboQuantScoreVTab>("turboquant_score")?;
     con.register_table_function::<TurboQuantBuildVTab>("turboquant_build")?;
     Ok(())
 }

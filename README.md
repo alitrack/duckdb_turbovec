@@ -15,9 +15,13 @@ SELECT * FROM turboquant_build(
     (SELECT string_agg(emb::VARCHAR, ',') FROM documents), 1536, 4, '/tmp/myidx.tv'
 );
 
--- 2. Search
+-- 2. Top-k search
 SELECT * FROM turboquant_search('/tmp/myidx.tv', '[0.1, 0.2, ...]', 10);
--- → (idx INT, score FLOAT)
+-- → (idx INT, score FLOAT) — top 10 nearest neighbors
+
+-- 3. Full scoring — all vectors with similarity scores
+SELECT * FROM turboquant_score('/tmp/myidx.tv', '[0.1, 0.2, ...]');
+-- → (idx INT, score FLOAT) — every vector in the index, sorted by score DESC
 ```
 
 ## SQL API
@@ -25,7 +29,8 @@ SELECT * FROM turboquant_search('/tmp/myidx.tv', '[0.1, 0.2, ...]', 10);
 | Function | Parameters | Returns |
 |---|---|---|
 | `turboquant_build(vectors_str, dim, bit_width, output_path)` | vectors_str: `[arr],[arr],...` from `string_agg`, dim, 2\|4, path | (path, rows) |
-| `turboquant_search(index_path, query_str, k)` | .tv file path, query as `'[f1,f2,...]'` string, top-k | (idx, score) |
+| `turboquant_search(index_path, query_str, k)` | .tv file path, query as `'[f1,f2,...]'` string, top-k | (idx, score) — top-k |
+| `turboquant_score(index_path, query_str)` | .tv file path, query as `'[f1,f2,...]'` string | (idx, score) — all vectors, sorted by score DESC |
 
 ## Build
 
@@ -59,8 +64,8 @@ python3 scripts/metadata.py target/release/turbovec.dll -o turbovec.duckdb_exten
 
 - [x] `turboquant_search()` VTab
 - [x] `turboquant_build()` — build index from DuckDB table via `string_agg`
+- [x] `turboquant_score()` — all-vector scoring
 - [x] macOS ARM + Linux x86_64 CI
-- [ ] `turboquant_score()` scalar function for row-by-row scoring
 - [ ] DuckDB Community Extension submission
 
 ## License
