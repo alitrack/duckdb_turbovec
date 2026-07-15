@@ -7,23 +7,8 @@ use duckdb::{
     vtab::{arrow::record_batch_to_duckdb_data_chunk, BindInfo, InitInfo, TableFunctionInfo, VTab},
     Connection, Result,
 };
-use std::{
-    error::Error,
-    sync::{atomic::AtomicPtr, Arc},
-};
+use std::{error::Error, sync::Arc};
 use turbovec::TurboQuantIndex;
-
-// ── Global: raw DuckDB database handle (captured at LOAD time) ──
-
-static RAW_DB: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-fn temp_conn() -> duckdb::Result<Connection> {
-    let raw = RAW_DB.load(std::sync::atomic::Ordering::Relaxed);
-    if raw.is_null() {
-        panic!("turboquant_build: extension not loaded properly");
-    }
-    unsafe { Connection::open_from_raw(raw as duckdb::ffi::duckdb_database) }
-}
 
 // ── turboquant_search(index_path, query_str, k) ──
 
@@ -117,7 +102,11 @@ impl VTab for TurboQuantSearchVTab {
     }
 }
 
-// ── turboquant_build(table, col, bit_width, output_path) ──
+// ── turboquant_build(vectors_str, dim, bit_width, output_path) ──
+// Receives vectors as a serialized string: [[x1,x2,...], [y1,y2,...], ...]
+// Built via: SELECT turboquant_build((
+//   SELECT string_agg(emb::VARCHAR, ',') FROM docs
+// ), 1536, 4, '/tmp/idx.tv')
 
 struct TurboQuantBuildVTab;
 
@@ -139,46 +128,23 @@ impl VTab for TurboQuantBuildVTab {
     fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
         let pc = bind.get_parameter_count();
         if pc < 4 {
-            return Err("turboquant_build: expected 4 params (table, col, bit_width, output_path)".into());
+            return Err("turboquant_build: expected 4 params (vectors_str, dim, bit_width, output_path)".into());
         }
-        let table = bind.get_parameter(0).to_string();
-        let col = bind.get_parameter(1).to_string();
+        let vectors_str = bind.get_parameter(0).to_string();
+        let dim: usize = bind.get_parameter(1).to_string().parse()?;
         let bw: usize = bind.get_parameter(2).to_string().parse()?;
         let output_path = bind.get_parameter(3).to_string();
 
-        let con = temp_conn()?;
-        let dim_sql = format!("SELECT len({col}) FROM {table} LIMIT 1");
-        let dim: usize = con
-            .query_row(&dim_sql, [], |row| row.get::<_, i32>(0))
-            .map_err(|e| format!("turboquant_build: cannot read '{table}': {e}"))?
-            as usize;
-        let count_sql = format!("SELECT count(*) FROM {table}");
-        let n: usize = con
-            .query_row(&count_sql, [], |row| row.get::<_, i64>(0))
-            .map_err(|e| format!("turboquant_build: {e}"))? as usize;
+        // Parse: "[[1,2,...], [3,4,...], ...]" → Vec<f32>
+        let vectors = parse_nested_float_arrays(&vectors_str, dim)?;
+        let n = vectors.len() / dim;
         if n == 0 {
-            return Err("turboquant_build: table has no rows".into());
+            return Err("turboquant_build: no vectors provided".into());
         }
-
-        let read_sql = format!("SELECT {col} FROM {table}");
-        let mut stmt = con.prepare(&read_sql)?;
-        let mut rows = stmt.query([])?;
 
         let mut idx =
             TurboQuantIndex::new(dim, bw).map_err(|e| format!("turboquant_build: {e}"))?;
-        let mut batch = Vec::with_capacity(2048 * dim);
-        while let Some(row) = rows.next()? {
-            let vec_str: String = row.get(0)?;
-            let vec = parse_float_array(&vec_str)?;
-            batch.extend_from_slice(&vec);
-            if batch.len() >= 2048 * dim {
-                idx.add(&batch);
-                batch.clear();
-            }
-        }
-        if !batch.is_empty() {
-            idx.add(&batch);
-        }
+        idx.add(&vectors);
         idx.write(&output_path)
             .map_err(|e| format!("turboquant_build: write error: {e}"))?;
 
@@ -215,10 +181,10 @@ impl VTab for TurboQuantBuildVTab {
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // vectors_str
+            LogicalTypeHandle::from(LogicalTypeId::Integer), // dim
+            LogicalTypeHandle::from(LogicalTypeId::Integer), // bit_width
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // output_path
         ])
     }
 }
@@ -240,20 +206,59 @@ fn parse_float_array(raw: &str) -> std::result::Result<Vec<f32>, Box<dyn Error>>
         .collect()
 }
 
+fn parse_nested_float_arrays(
+    raw: &str,
+    dim: usize,
+) -> std::result::Result<Vec<f32>, Box<dyn Error>> {
+    // Input: "[[1,2,3], [4,5,6], ...]" or "[1,2,3,4,5,6,...]"
+    let s = raw.trim();
+    let mut result = Vec::new();
+
+    // Try flat array first: [1,2,3,4,5,6,...]
+    if !s.starts_with("[[") {
+        return parse_float_array(s);
+    }
+
+    // Nested: [[1,2,3], [4,5,6], ...]
+    let inner = &s[1..s.len() - 1]; // strip outer [ ]
+    let mut depth = 0;
+    let mut current = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '[' => {
+                if depth == 0 {
+                    current.clear();
+                } else {
+                    current.push(ch);
+                }
+                depth += 1;
+            }
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    let arr = parse_float_array(&format!("[{}]", current))?;
+                    if arr.len() != dim {
+                        return Err(format!(
+                            "turboquant_build: dim mismatch: expected {dim}, got {}",
+                            arr.len()
+                        ).into());
+                    }
+                    result.extend(arr);
+                } else {
+                    current.push(ch);
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    Ok(result)
+}
+
 // ── Entrypoint ──
 
-unsafe fn extension_init(con: Connection) -> Result<(), Box<dyn Error>> {
+#[duckdb_entrypoint_c_api(ext_name = "turbovec")]
+pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<TurboQuantSearchVTab>("turboquant_search")?;
     con.register_table_function::<TurboQuantBuildVTab>("turboquant_build")?;
     Ok(())
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn turbovec_init_c_api(raw_db: duckdb::ffi::duckdb_database) {
-    RAW_DB.store(
-        raw_db as *mut std::ffi::c_void,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let con = Connection::open_from_raw(raw_db).unwrap();
-    extension_init(con).unwrap();
 }
