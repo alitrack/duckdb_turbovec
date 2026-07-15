@@ -211,16 +211,32 @@ fn parse_nested_float_arrays(
     raw: &str,
     dim: usize,
 ) -> std::result::Result<Vec<f32>, Box<dyn Error>> {
-    // Input: "[[1,2,3], [4,5,6], ...]" or "[1,2,3,4,5,6,...]"
     let s = raw.trim();
     let mut result = Vec::new();
 
-    // Try flat array first: [1,2,3,4,5,6,...]
-    if !s.starts_with("[[") {
+    // Flat array: [1,2,3,4,5,6,...] (already handled)
+    if s.starts_with('[') && !s.starts_with("[[") {
+        // Could be "[arr1], [arr2], ..." from string_agg
+        // OR a single flat array "[1,2,3,...]"
+        // Detect: if after the first ], there's a comma and another [, it's nested
+        if let Some(first_close) = s.find(']') {
+            let after = s[first_close + 1..].trim();
+            if after.starts_with(',') {
+                // string_agg format: "[...], [...], ..."
+                // Wrap in outer brackets to make it "[[...], [...]]"
+                let wrapped = format!("[{}]", s);
+                return parse_nested_float_arrays(&wrapped, dim);
+            }
+        }
+        // Single flat array
         return parse_float_array(s);
     }
 
-    // Nested: [[1,2,3], [4,5,6], ...]
+    // Nested: [[...], [...], ...]
+    if !s.starts_with("[[") {
+        return Err(format!("turboquant_build: expected nested or flat array, got '{}'", &s[..64.min(s.len())]).into());
+    }
+
     let inner = &s[1..s.len() - 1]; // strip outer [ ]
     let mut depth = 0;
     let mut current = String::new();
@@ -242,7 +258,8 @@ fn parse_nested_float_arrays(
                         return Err(format!(
                             "turboquant_build: dim mismatch: expected {dim}, got {}",
                             arr.len()
-                        ).into());
+                        )
+                        .into());
                     }
                     result.extend(arr);
                 } else {
