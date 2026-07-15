@@ -4,6 +4,7 @@ use arrow::{
 };
 use duckdb::{
     core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
+    duckdb_entrypoint_c_api,
     vtab::{arrow::record_batch_to_duckdb_data_chunk, BindInfo, InitInfo, TableFunctionInfo, VTab},
     Connection, Result,
 };
