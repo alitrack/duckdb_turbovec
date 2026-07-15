@@ -1,0 +1,10 @@
+@@ -107,7 +107,8 @@
+ }
+ 
+ // ── turboquant_score(index_path, query_str) ──
+-// Returns cosine similarity scores for ALL vectors in the index.
++// Returns TurboQuant quantized similarity scores for ALL vectors in the index.
++// NOTE: These are approximate quantized scores, NOT exact cosine similarity.
+ // Output columns: (idx INT, score FLOAT) ordered by score DESC.
+ 
+ #[repr(C)]

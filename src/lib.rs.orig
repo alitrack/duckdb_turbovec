@@ -104,8 +104,6 @@ impl VTab for TurboQuantSearchVTab {
 }
 
 // ── turboquant_score(index_path, query_str) ──
-// Returns TurboQuant quantized similarity scores for ALL vectors.
-// NOTE: these are approximate quantized scores, NOT exact cosine.
 
 #[repr(C)]
 pub struct ScoreInitData {
