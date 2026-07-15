@@ -4,32 +4,29 @@ use arrow::{
 };
 use duckdb::{
     core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
-    vtab::{
-        arrow::record_batch_to_duckdb_data_chunk,
-        BindInfo, InitInfo, TableFunctionInfo, VTab,
-    },
+    vtab::{arrow::record_batch_to_duckdb_data_chunk, BindInfo, InitInfo, TableFunctionInfo, VTab},
     Connection, Result,
 };
 use std::{
     error::Error,
-    ffi::c_void,
     sync::{atomic::AtomicPtr, Arc},
 };
 use turbovec::TurboQuantIndex;
 
 // ── Global: raw DuckDB database handle (captured at LOAD time) ──
-static RAW_DB: AtomicPtr<ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Get a temporary Connection from the raw handle (VTab callbacks can use this).
+static RAW_DB: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
 fn temp_conn() -> duckdb::Result<Connection> {
     let raw = RAW_DB.load(std::sync::atomic::Ordering::Relaxed);
     if raw.is_null() {
-        panic!("RAW_DB not initialized — extension not loaded properly");
+        panic!("turboquant_build: extension not loaded properly");
     }
-    unsafe { Connection::open_from_raw(raw as ffi::duckdb_database) }
+    unsafe { Connection::open_from_raw(raw as duckdb::ffi::duckdb_database) }
 }
 
-/// Search results cache.
+// ── turboquant_search(index_path, query_str, k) ──
+
 #[repr(C)]
 struct SearchInitData {
     done: std::sync::atomic::AtomicBool,
@@ -41,7 +38,6 @@ struct SearchBindData {
     schema: Arc<arrow::datatypes::Schema>,
 }
 
-// ── turboquant_search(index_path, query_str, k) ──
 struct TurboQuantSearchVTab;
 
 impl VTab for TurboQuantSearchVTab {
@@ -75,7 +71,6 @@ impl VTab for TurboQuantSearchVTab {
         ]));
         bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
-
         Ok(SearchBindData { results, schema })
     }
 
@@ -99,7 +94,6 @@ impl VTab for TurboQuantSearchVTab {
             output.set_len(0);
             return Ok(());
         }
-
         let indices: Vec<i32> = bind.results.iter().take(n).map(|r| r.0).collect();
         let scores: Vec<f32> = bind.results.iter().take(n).map(|r| r.1).collect();
         let batch = RecordBatch::try_new(
@@ -123,9 +117,8 @@ impl VTab for TurboQuantSearchVTab {
     }
 }
 
-// ── turboquant_build(table_name, col_name, bit_width, output_path) ──
-// Reads vectors from a DuckDB table, builds a turbovec index, saves to file.
-// Uses the raw DB handle captured at LOAD time.
+// ── turboquant_build(table, col, bit_width, output_path) ──
+
 struct TurboQuantBuildVTab;
 
 #[repr(C)]
@@ -153,34 +146,26 @@ impl VTab for TurboQuantBuildVTab {
         let bw: usize = bind.get_parameter(2).to_string().parse()?;
         let output_path = bind.get_parameter(3).to_string();
 
-        // Use temp connection from raw handle to read the table
         let con = temp_conn()?;
-
-        // Get dimension from first row
         let dim_sql = format!("SELECT len({col}) FROM {table} LIMIT 1");
         let dim: usize = con
             .query_row(&dim_sql, [], |row| row.get::<_, i32>(0))
-            .map_err(|e| format!("turboquant_build: cannot read table '{table}': {e}"))? as usize;
-
-        // Count rows
+            .map_err(|e| format!("turboquant_build: cannot read '{table}': {e}"))?
+            as usize;
         let count_sql = format!("SELECT count(*) FROM {table}");
         let n: usize = con
             .query_row(&count_sql, [], |row| row.get::<_, i64>(0))
             .map_err(|e| format!("turboquant_build: {e}"))? as usize;
-
         if n == 0 {
             return Err("turboquant_build: table has no rows".into());
         }
 
-        // Read all vectors and build index
         let read_sql = format!("SELECT {col} FROM {table}");
         let mut stmt = con.prepare(&read_sql)?;
         let mut rows = stmt.query([])?;
 
-        let mut idx = TurboQuantIndex::new(dim, bw)
-            .map_err(|e| format!("turboquant_build: {e}"))?;
-
-        // Read in batches of 2048
+        let mut idx =
+            TurboQuantIndex::new(dim, bw).map_err(|e| format!("turboquant_build: {e}"))?;
         let mut batch = Vec::with_capacity(2048 * dim);
         while let Some(row) = rows.next()? {
             let vec_str: String = row.get(0)?;
@@ -194,13 +179,11 @@ impl VTab for TurboQuantBuildVTab {
         if !batch.is_empty() {
             idx.add(&batch);
         }
-
         idx.write(&output_path)
-            .map_err(|e| format!("turboquant_build: cannot write '{output_path}': {e}"))?;
+            .map_err(|e| format!("turboquant_build: write error: {e}"))?;
 
         bind.add_result_column("output_path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("rows", LogicalTypeHandle::from(LogicalTypeId::Integer));
-
         Ok(BuildBindData { output_path, rows: n })
     }
 
@@ -218,13 +201,11 @@ impl VTab for TurboQuantBuildVTab {
             return Ok(());
         }
         init.done.store(true, std::sync::atomic::Ordering::Relaxed);
-
         let bind = func.get_bind_data();
         let schema = Arc::new(Schema::new(vec![
             Field::new("output_path", DataType::Utf8, false),
             Field::new("rows", DataType::Int32, false),
         ]));
-
         let path_arr = arrow::array::StringArray::from(vec![bind.output_path.as_str()]);
         let rows_arr = Int32Array::from(vec![bind.rows as i32]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(path_arr), Arc::new(rows_arr)])?;
@@ -234,43 +215,45 @@ impl VTab for TurboQuantBuildVTab {
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // table
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // column
-            LogicalTypeHandle::from(LogicalTypeId::Integer), // bit_width
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // output_path
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ])
     }
-}
-
-// ── Custom entrypoint: capture raw DB handle, then delegate ──
-
-/// The actual init logic (called by the raw entrypoint after capturing the DB handle).
-unsafe fn extension_init(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_table_function::<TurboQuantSearchVTab>("turboquant_search")?;
-    con.register_table_function::<TurboQuantBuildVTab>("turboquant_build")?;
-    Ok(())
-}
-
-mod ffi {
-    pub use duckdb::ffi::duckdb_database;
 }
 
 // ── Utilities ──
 
 fn parse_float_array(raw: &str) -> std::result::Result<Vec<f32>, Box<dyn Error>> {
     let cleaned = raw.trim().trim_start_matches('[').trim_end_matches(']');
-    if cleaned.is_empty() { return Ok(Vec::new()); }
-    cleaned.split(',')
-        .map(|s| s.trim().parse::<f32>().map_err(|e| format!("invalid float '{s}': {e}").into()))
+    if cleaned.is_empty() {
+        return Ok(Vec::new());
+    }
+    cleaned
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<f32>()
+                .map_err(|e| format!("invalid float '{s}': {e}").into())
+        })
         .collect()
 }
 
-// ── No-std-compatible entrypoint ──
+// ── Entrypoint ──
+
+unsafe fn extension_init(con: Connection) -> Result<(), Box<dyn Error>> {
+    con.register_table_function::<TurboQuantSearchVTab>("turboquant_search")?;
+    con.register_table_function::<TurboQuantBuildVTab>("turboquant_build")?;
+    Ok(())
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn turbovec_init_c_api(raw_db: ffi::duckdb_database) {
-    // Capture the raw handle before wrapping
-    RAW_DB.store(raw_db as *mut ffi::c_void, std::sync::atomic::Ordering::Relaxed);
+pub unsafe extern "C" fn turbovec_init_c_api(raw_db: duckdb::ffi::duckdb_database) {
+    RAW_DB.store(
+        raw_db as *mut std::ffi::c_void,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let con = Connection::open_from_raw(raw_db).unwrap();
     extension_init(con).unwrap();
 }
