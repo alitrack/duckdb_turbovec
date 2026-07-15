@@ -12,20 +12,19 @@ use std::{error::Error, sync::Arc};
 use turbovec::TurboQuantIndex;
 
 // ── turboquant_search(index_path, query_str, k) ──
-// Top-k ANN search: returns (idx, score) for the k nearest neighbors.
 
 #[repr(C)]
-struct SearchInitData {
+pub struct SearchInitData {
     done: std::sync::atomic::AtomicBool,
 }
 
 #[repr(C)]
-struct SearchBindData {
+pub struct SearchBindData {
     results: Vec<(i32, f32)>,
     schema: Arc<arrow::datatypes::Schema>,
 }
 
-struct TurboQuantSearchVTab;
+pub struct TurboQuantSearchVTab;
 
 impl VTab for TurboQuantSearchVTab {
     type BindData = SearchBindData;
@@ -105,21 +104,19 @@ impl VTab for TurboQuantSearchVTab {
 }
 
 // ── turboquant_score(index_path, query_str) ──
-// Returns cosine similarity scores for ALL vectors in the index.
-// Output columns: (idx INT, score FLOAT) ordered by score DESC.
 
 #[repr(C)]
-struct ScoreInitData {
+pub struct ScoreInitData {
     done: std::sync::atomic::AtomicBool,
 }
 
 #[repr(C)]
-struct ScoreBindData {
+pub struct ScoreBindData {
     results: Vec<(i32, f32)>,
     schema: Arc<arrow::datatypes::Schema>,
 }
 
-struct TurboQuantScoreVTab;
+pub struct TurboQuantScoreVTab;
 
 impl VTab for TurboQuantScoreVTab {
     type BindData = ScoreBindData;
@@ -144,7 +141,6 @@ impl VTab for TurboQuantScoreVTab {
             return Ok(ScoreBindData { results: Vec::new(), schema });
         }
 
-        // search with k=n returns all vectors sorted by score desc
         let sr = idx.search(&query, n);
         let results: Vec<(i32, f32)> = (0..n)
             .map(|j| (sr.indices[j] as i32, sr.scores[j]))
@@ -195,27 +191,23 @@ impl VTab for TurboQuantScoreVTab {
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // path
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // query_str
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ])
     }
 }
 
 // ── turboquant_build(vectors_str, dim, bit_width, output_path) ──
-// Receives vectors as a serialized string: [[x1,x2,...], [y1,y2,...], ...]
-// Built via: SELECT turboquant_build((
-//   SELECT string_agg(emb::VARCHAR, ',') FROM docs
-// ), 1536, 4, '/tmp/idx.tv')
 
-struct TurboQuantBuildVTab;
+pub struct TurboQuantBuildVTab;
 
 #[repr(C)]
-struct BuildInitData {
+pub struct BuildInitData {
     done: std::sync::atomic::AtomicBool,
 }
 
 #[repr(C)]
-struct BuildBindData {
+pub struct BuildBindData {
     output_path: String,
     rows: usize,
 }
@@ -227,14 +219,16 @@ impl VTab for TurboQuantBuildVTab {
     fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
         let pc = bind.get_parameter_count();
         if pc < 4 {
-            return Err("turboquant_build: expected 4 params (vectors_str, dim, bit_width, output_path)".into());
+            return Err(
+                "turboquant_build: expected 4 params (vectors_str, dim, bit_width, output_path)"
+                    .into(),
+            );
         }
         let vectors_str = bind.get_parameter(0).to_string();
         let dim: usize = bind.get_parameter(1).to_string().parse()?;
         let bw: usize = bind.get_parameter(2).to_string().parse()?;
         let output_path = bind.get_parameter(3).to_string();
 
-        // Parse: "[[1,2,...], [3,4,...], ...]" → Vec<f32>
         let vectors = parse_nested_float_arrays(&vectors_str, dim)?;
         let n = vectors.len() / dim;
         if n == 0 {
@@ -247,9 +241,15 @@ impl VTab for TurboQuantBuildVTab {
         idx.write(&output_path)
             .map_err(|e| format!("turboquant_build: write error: {e}"))?;
 
-        bind.add_result_column("output_path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column(
+            "output_path",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
         bind.add_result_column("rows", LogicalTypeHandle::from(LogicalTypeId::Integer));
-        Ok(BuildBindData { output_path, rows: n })
+        Ok(BuildBindData {
+            output_path,
+            rows: n,
+        })
     }
 
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
@@ -280,10 +280,10 @@ impl VTab for TurboQuantBuildVTab {
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // vectors_str
-            LogicalTypeHandle::from(LogicalTypeId::Integer), // dim
-            LogicalTypeHandle::from(LogicalTypeId::Integer), // bit_width
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // output_path
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ])
     }
 }
@@ -312,30 +312,26 @@ fn parse_nested_float_arrays(
     let s = raw.trim();
     let mut result = Vec::new();
 
-    // Flat array: [1,2,3,4,5,6,...] (already handled)
     if s.starts_with('[') && !s.starts_with("[[") {
-        // Could be "[arr1], [arr2], ..." from string_agg
-        // OR a single flat array "[1,2,3,...]"
-        // Detect: if after the first ], there's a comma and another [, it's nested
         if let Some(first_close) = s.find(']') {
             let after = s[first_close + 1..].trim();
             if after.starts_with(',') {
-                // string_agg format: "[...], [...], ..."
-                // Wrap in outer brackets to make it "[[...], [...]]"
                 let wrapped = format!("[{}]", s);
                 return parse_nested_float_arrays(&wrapped, dim);
             }
         }
-        // Single flat array
         return parse_float_array(s);
     }
 
-    // Nested: [[...], [...], ...]
     if !s.starts_with("[[") {
-        return Err(format!("turboquant_build: expected nested or flat array, got '{}'", &s[..64.min(s.len())]).into());
+        return Err(format!(
+            "turboquant_build: expected nested or flat array, got '{}'",
+            &s[..64.min(s.len())]
+        )
+        .into());
     }
 
-    let inner = &s[1..s.len() - 1]; // strip outer [ ]
+    let inner = &s[1..s.len() - 1];
     let mut depth = 0;
     let mut current = String::new();
     for ch in inner.chars() {
