@@ -4,6 +4,21 @@
 import argparse
 import shutil
 import os
+import platform
+import sys
+
+
+def detect_platform():
+    """Auto-detect DuckDB platform string."""
+    system = platform.system()
+    machine = platform.machine()
+    if system == "Linux":
+        return "linux_amd64" if machine == "x86_64" else "linux_arm64"
+    elif system == "Darwin":
+        return "osx_arm64" if machine == "arm64" else "osx_amd64"
+    elif system == "Windows":
+        return "windows_amd64"
+    return "linux_amd64"  # fallback
 
 
 def start_signature():
@@ -27,10 +42,12 @@ def main():
     parser = argparse.ArgumentParser(description="Append DuckDB extension metadata")
     parser.add_argument("input", help="Input shared library (.so/.dylib)")
     parser.add_argument("-o", "--output", required=True, help="Output .duckdb_extension file")
-    parser.add_argument("--platform", default="linux_amd64", help="DuckDB platform (e.g. linux_amd64)")
+    parser.add_argument("--platform", default=None, help="DuckDB platform (auto-detected if omitted)")
     parser.add_argument("--duckdb-version", default="v1.2.0", help="DuckDB version")
     parser.add_argument("--extension-version", default="0.1.0", help="Extension version")
     args = parser.parse_args()
+
+    platform_str = args.platform or detect_platform()
 
     shutil.copyfile(args.input, args.output)
 
@@ -42,7 +59,7 @@ def main():
         f.write(padded_byte_string("C_STRUCT"))  # FIELD5 abi_type
         f.write(padded_byte_string(args.extension_version))  # FIELD4
         f.write(padded_byte_string(args.duckdb_version))  # FIELD3
-        f.write(padded_byte_string(args.platform))  # FIELD2
+        f.write(padded_byte_string(platform_str))  # FIELD2
         f.write(padded_byte_string("4"))  # FIELD1 header signature
         f.write(b"\x00" * 256)  # signature space
 
