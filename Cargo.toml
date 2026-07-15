@@ -1,0 +1,25 @@
+[package]
+name = "duckdb_turbovec"
+version = "0.1.0"
+edition = "2021"
+description = "DuckDB extension for compressed vector search using Google's TurboQuant (turbovec)"
+license = "MIT"
+repository = "https://github.com/alitrack/duckdb_turbovec"
+
+[lib]
+name = "turbovec"
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+strip = true
+
+[[example]]
+name = "duckdb_turbovec"
+path = "src/wasm_lib.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] }
+turbovec = "0.9"
+arrow = "58"
