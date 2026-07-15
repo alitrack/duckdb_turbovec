@@ -23,16 +23,3 @@ crate-type = ["staticlib"]
 duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] }
 turbovec = "0.9"
 arrow = "58"
-
-[features]
-default = []
-test-bundled = ["duckdb/bundled"]
-
-[[test]]
-name = "integration_test"
-required-features = ["test-bundled"]
-
-[dependencies]
-duckdb = { version = ~1.10504.0, features = [loadable-extension, vscalar] }
-turbovec = 0.9
-arrow = 58
