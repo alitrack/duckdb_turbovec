@@ -43,7 +43,7 @@ def main():
     parser.add_argument("input", help="Input shared library (.so/.dylib/.dll)")
     parser.add_argument("-o", "--output", required=True, help="Output .duckdb_extension file")
     parser.add_argument("--platform", default=None, help="DuckDB platform (auto-detected if omitted)")
-    parser.add_argument("--duckdb-version", default="v1.5.4", help="DuckDB version")
+    parser.add_argument("--duckdb-version", default="v1.2.0", help="DuckDB version")
     parser.add_argument("--extension-version", default="0.1.0", help="Extension version")
     args = parser.parse_args()
 
