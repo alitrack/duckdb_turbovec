@@ -17,7 +17,7 @@ def detect_platform():
     elif system == "Darwin":
         return "osx_arm64" if machine == "arm64" else "osx_amd64"
     elif system == "Windows":
-        return "windows_amd64"
+        return "windows_amd64" if machine in ("AMD64", "x86_64") else "windows_arm64"
     return "linux_amd64"  # fallback
 
 
@@ -40,7 +40,7 @@ def padded_byte_string(s):
 
 def main():
     parser = argparse.ArgumentParser(description="Append DuckDB extension metadata")
-    parser.add_argument("input", help="Input shared library (.so/.dylib)")
+    parser.add_argument("input", help="Input shared library (.so/.dylib/.dll)")
     parser.add_argument("-o", "--output", required=True, help="Output .duckdb_extension file")
     parser.add_argument("--platform", default=None, help="DuckDB platform (auto-detected if omitted)")
     parser.add_argument("--duckdb-version", default="v1.2.0", help="DuckDB version")

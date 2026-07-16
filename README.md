@@ -66,7 +66,7 @@ python3 scripts/metadata.py target/release/turbovec.dll -o turbovec.duckdb_exten
 - [x] `turboquant_search()` VTab
 - [x] `turboquant_build()` — build index from DuckDB table via `string_agg`
 - [x] `turboquant_score()` — all-vector scoring
-- [x] macOS ARM + Linux x86_64 CI
+- [x] macOS ARM + Linux x86_64 + Windows x86_64 CI
 - [ ] Direct table column input for `turboquant_build()` (no `string_agg`)
 - [ ] DuckDB Community Extension submission
 
