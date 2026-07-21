@@ -38,9 +38,10 @@ impl VTab for TurboQuantSearchVTab {
         let path = bind.get_parameter(0).to_string();
         let query = parse_float_array(&bind.get_parameter(1).to_string())?;
         let k: usize = bind.get_parameter(2).to_string().parse()?;
-
         let idx = TurboQuantIndex::load(&path)
             .map_err(|e| format!("turboquant_search: {e}"))?;
+        let n = idx.len();
+        let k = k.min(n);  // clamp to index size
         let sr = idx.search(&query, k);
 
         let mut results = Vec::with_capacity(sr.nq * k);
