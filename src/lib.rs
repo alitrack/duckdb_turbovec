@@ -791,7 +791,12 @@ impl VTab for IvfSearchVTab {
 
         let meta = IvfMeta::load(&format!("{}/meta.bin", dir))?;
         let dim = meta.dim;
-        let probes = probes.min(meta.num_lists);
+        // probes=0 or probes=-1 → auto: scan all clusters (guaranteed recall)
+        let probes = if probes == 0 || probes == usize::MAX {
+            meta.num_lists
+        } else {
+            probes.min(meta.num_lists)
+        };
 
         // Find nearest centroids
         let mut centroid_dists: Vec<(usize, f32)> = (0..meta.num_lists)
@@ -878,6 +883,269 @@ impl VTab for IvfSearchVTab {
     }
 }
 
+// ── turboquant_add(index_path, vectors_str, dim) ──
+// Load existing index, append vectors, write back.
+
+pub struct TurboQuantAddVTab;
+
+#[repr(C)]
+pub struct AddInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+pub struct AddBindData {
+    output_path: String,
+    added: usize,
+    total: usize,
+}
+
+impl VTab for TurboQuantAddVTab {
+    type BindData = AddBindData;
+    type InitData = AddInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let pc = bind.get_parameter_count();
+        if pc < 3 {
+            return Err(
+                "turboquant_add: expected 3 params (path, vectors_str, dim)".into(),
+            );
+        }
+        let path = bind.get_parameter(0).to_string();
+        let vectors_str = bind.get_parameter(1).to_string();
+        let dim: usize = bind.get_parameter(2).to_string().parse()?;
+
+        let vectors = parse_nested_float_arrays(&vectors_str, dim)?;
+        let to_add = vectors.len() / dim;
+        if to_add == 0 {
+            return Err("turboquant_add: no vectors provided".into());
+        }
+
+        let mut idx = TurboQuantIndex::load(&path)
+            .map_err(|e| format!("turboquant_add: load error: {e}"))?;
+        let before = idx.len();
+        idx.add(&vectors);
+        idx.write(&path)
+            .map_err(|e| format!("turboquant_add: write error: {e}"))?;
+
+        bind.add_result_column("output_path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("added", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("total", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        Ok(AddBindData { output_path: path, added: to_add, total: before + to_add })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(AddInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0); return Ok(());
+        }
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bind = func.get_bind_data();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("output_path", DataType::Utf8, false),
+            Field::new("added", DataType::Int32, false),
+            Field::new("total", DataType::Int32, false),
+        ]));
+        let path_arr = arrow::array::StringArray::from(vec![bind.output_path.as_str()]);
+        let added_arr = Int32Array::from(vec![bind.added as i32]);
+        let total_arr = Int32Array::from(vec![bind.total as i32]);
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(path_arr), Arc::new(added_arr), Arc::new(total_arr),
+        ])?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+}
+
+// ── turboquant_remove(index_path, idx) ──
+// Remove a vector by index with swap_remove (O(1)), rewrite file.
+
+pub struct TurboQuantRemoveVTab;
+
+#[repr(C)]
+pub struct RemoveInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+pub struct RemoveBindData {
+    output_path: String,
+    removed_idx: usize,
+    remaining: usize,
+}
+
+impl VTab for TurboQuantRemoveVTab {
+    type BindData = RemoveBindData;
+    type InitData = RemoveInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let pc = bind.get_parameter_count();
+        if pc < 2 {
+            return Err("turboquant_remove: expected 2 params (path, idx)".into());
+        }
+        let path = bind.get_parameter(0).to_string();
+        let target: usize = bind.get_parameter(1).to_string().parse()?;
+
+        let mut idx = TurboQuantIndex::load(&path)
+            .map_err(|e| format!("turboquant_remove: load error: {e}"))?;
+        let before = idx.len();
+        if target >= before {
+            return Err(format!(
+                "turboquant_remove: idx {target} out of range (0..{before})"
+            ).into());
+        }
+        idx.swap_remove(target);
+        idx.write(&path)
+            .map_err(|e| format!("turboquant_remove: write error: {e}"))?;
+
+        bind.add_result_column("output_path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("removed_idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("remaining", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        Ok(RemoveBindData { output_path: path, removed_idx: target, remaining: before - 1 })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(RemoveInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0); return Ok(());
+        }
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bind = func.get_bind_data();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("output_path", DataType::Utf8, false),
+            Field::new("removed_idx", DataType::Int32, false),
+            Field::new("remaining", DataType::Int32, false),
+        ]));
+        let path_arr = arrow::array::StringArray::from(vec![bind.output_path.as_str()]);
+        let ridx_arr = Int32Array::from(vec![bind.removed_idx as i32]);
+        let rem_arr = Int32Array::from(vec![bind.remaining as i32]);
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(path_arr), Arc::new(ridx_arr), Arc::new(rem_arr),
+        ])?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+}
+
+// ── turboquant_build_concat(output_path, dim, bit_width, values_str) ──
+// Build from flat comma-separated float list (output of string_agg).
+// Avoids nested-array string format. dim passed explicitly.
+// Usage: SELECT * FROM turboquant_build_concat('/tmp/idx.tv', 1024, 4, getvariable('v'));
+
+pub struct TurboQuantBuildConcatVTab;
+
+#[repr(C)]
+pub struct BuildConcatInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+pub struct BuildConcatBindData {
+    output_path: String,
+    rows: usize,
+}
+
+impl VTab for TurboQuantBuildConcatVTab {
+    type BindData = BuildConcatBindData;
+    type InitData = BuildConcatInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let pc = bind.get_parameter_count();
+        if pc < 4 {
+            return Err(
+                "turboquant_build_concat: expected 4 params (output_path, dim, bit_width, values_str)"
+                    .into(),
+            );
+        }
+        let output_path = bind.get_parameter(0).to_string();
+        let dim: usize = bind.get_parameter(1).to_string().parse()?;
+        let bw: usize = bind.get_parameter(2).to_string().parse()?;
+        let values_str = bind.get_parameter(3).to_string();
+
+        // Parse flat comma-separated floats (NOT nested arrays)
+        let all = parse_float_array(&format!("[{}]", values_str))?;
+        if all.len() % dim != 0 {
+            return Err(format!(
+                "turboquant_build_concat: {} floats not divisible by dim {}", all.len(), dim
+            ).into());
+        }
+        let n = all.len() / dim;
+        if n == 0 {
+            return Err("turboquant_build_concat: no vectors".into());
+        }
+
+        let mut idx = TurboQuantIndex::new(dim, bw)
+            .map_err(|e| format!("turboquant_build_concat: {e}"))?;
+        idx.add(&all);
+        idx.write(&output_path)
+            .map_err(|e| format!("turboquant_build_concat: write error: {e}"))?;
+
+        bind.add_result_column("output_path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("rows", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        Ok(BuildConcatBindData { output_path, rows: n })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(BuildConcatInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0); return Ok(());
+        }
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bind = func.get_bind_data();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("output_path", DataType::Utf8, false),
+            Field::new("rows", DataType::Int32, false),
+        ]));
+        let path_arr = arrow::array::StringArray::from(vec![bind.output_path.as_str()]);
+        let rows_arr = Int32Array::from(vec![bind.rows as i32]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(path_arr), Arc::new(rows_arr)])?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        ])
+    }
+}
+
 // ── Entrypoint ──
 
 #[duckdb_entrypoint_c_api(ext_name = "turbovec")]
@@ -886,6 +1154,9 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_table_function::<TurboQuantScoreVTab>("turboquant_score")?;
     con.register_table_function::<TurboQuantBuildVTab>("turboquant_build")?;
     con.register_table_function::<TurboQuantBuildListVTab>("turboquant_build_list")?;
+    con.register_table_function::<TurboQuantBuildConcatVTab>("turboquant_build_concat")?;
+    con.register_table_function::<TurboQuantAddVTab>("turboquant_add")?;
+    con.register_table_function::<TurboQuantRemoveVTab>("turboquant_remove")?;
     con.register_table_function::<IvfBuildVTab>("turboquant_build_ivf")?;
     con.register_table_function::<IvfSearchVTab>("turboquant_search_ivf")?;
     Ok(())

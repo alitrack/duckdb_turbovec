@@ -5,7 +5,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DUCKDB="${1:-duckdb}"
+DUCKDB="${1:-duckdb} -unsigned"
 TMPDIR="$(mktemp -d)"
 trap "rm -rf $TMPDIR" EXIT
 
@@ -148,6 +148,55 @@ SELECT COUNT(*) FROM turboquant_search_ivf('$IVF_DIR', '[0.1,0.2,0.3,0.4,0.5,0.6
 OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
 echo "$OUT" | grep -q "5" && pass "IVF search top-5" || fail "IVF search" "$OUT"
 
+# ── Test: IVF auto-probe (probes=0 → full scan) ──
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT COUNT(*) FROM turboquant_search_ivf('$IVF_DIR', '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]', 5, 0);
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "5" && pass "IVF auto-probe returns top-5" || fail "IVF auto-probe" "$OUT"
+
+# ── Test: turboquant_add (incremental append) ──
+IDX_ADD="$TMPDIR/add_test.tv"
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT * FROM turboquant_build('[[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8],[0.2,0.1,0.4,0.3,0.6,0.5,0.8,0.7]]', 8, 4, '$IDX_ADD');
+"
+$DUCKDB -noheader -c "$SQL" 2>&1 > /dev/null
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT * FROM turboquant_add('$IDX_ADD', '[[0.3,0.1,0.2,0.4,0.6,0.5,0.7,0.8]]', 8);
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "3" && pass "turboquant_add total=3" || fail "turboquant_add" "$OUT"
+
+# ── Test: turboquant_remove ──
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT * FROM turboquant_remove('$IDX_ADD', 0);
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "2" && pass "turboquant_remove remaining=2" || fail "turboquant_remove" "$OUT"
+
+# ── Test: turboquant_build_concat ──
+IDX_CONCAT="$TMPDIR/concat_test.tv"
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT * FROM turboquant_build_concat('$IDX_CONCAT', 4, 4, '0.1,0.2,0.3,0.4,0.2,0.1,0.4,0.3');
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "2" && pass "turboquant_build_concat rows=2" || fail "build_concat" "$OUT"
+echo "$OUT" | grep -q "$IDX_CONCAT" && pass "build_concat output_path" || fail "build_concat path" "$OUT"
+
+# ── Test: search concat-built index ──
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT COUNT(*) FROM turboquant_search('$IDX_CONCAT', '[0.1,0.2,0.3,0.4]', 2);
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "2" && pass "search concat index" || fail "search concat" "$OUT"
+
 echo ""
+
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0] — 2026-07-24
+
+### Added
+- `turboquant_add(index_path, vectors_str, dim)` — incrementally append vectors to existing index
+- `turboquant_remove(index_path, idx)` — remove a vector by index (swap_remove, O(1))
+- `turboquant_build_concat(output_path, dim, bit_width, values_str)` — build from flat comma-separated float list (no nested array format)
+- IVF auto-probe: `turboquant_search_ivf(..., probes=0)` → full scan all clusters for guaranteed recall
+- 6 new integration tests: add, remove, build_concat, search concat, IVF auto-probe (22 total)
+
 ## [0.2.0] — 2026-07-24
 
 ### Added
