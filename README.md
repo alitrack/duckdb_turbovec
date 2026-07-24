@@ -43,16 +43,16 @@ SELECT * FROM turboquant_score('/tmp/myidx.tv', '[0.1, 0.2, ...]');
 ## SQL API
 
 | Function | Parameters | Returns |
-|---|---|---|---|
-| `turboquant_build(vectors_str, dim, bit_width, output_path)` | vectors_str: `'[[arr],[arr],...'` string, dim, 2\|3\|4, path | (output_path, rows) |
-| `turboquant_build_list(vectors_list, bit_width, output_path)` | vectors_list: flat `[f1,f2,...]` LIST, 2\|3\|4, path | (output_path, rows, dim) — dim auto-detected |
-| `turboquant_build_concat(output_path, dim, bit_width, values_str)` | path, dim, 2\|3\|4, comma-separated `'f1,f2,...'` | (output_path, rows) |
-| `turboquant_build_ivf(vectors_str, dim, bit_width, num_lists, output_dir)` | vectors_str, dim, 2\|3\|4, num_lists (K-means k), output_dir | (output_dir, rows, num_lists) |
-| `turboquant_add(index_path, vectors_str, dim)` | existing .tv path, new vectors string, dim | (output_path, added, total) |
+|---|---|---|
+| `turboquant_build(vectors_str, dim, bit_width, output_path)` | nested array string `[[a,b],[c,d]]`, dim, 2/3/4, path | (output_path, rows) |
+| `turboquant_build_list(vectors_list, bit_width, output_path)` | flat `[f1,f2,...]` LIST, 2/3/4, path | (output_path, rows, dim) — dim auto-detected |
+| `turboquant_build_concat(output_path, dim, bit_width, values_str)` | path, dim, 2/3/4, comma-separated `f1,f2,...` | (output_path, rows) |
+| `turboquant_build_ivf(vectors_str, dim, bit_width, num_lists, output_dir)` | nested array string, dim, 2/3/4, k, dir | (output_dir, rows, num_lists) |
+| `turboquant_add(index_path, vectors_str, dim)` | existing .tv path, nested array string, dim | (output_path, added, total) |
 | `turboquant_remove(index_path, idx)` | .tv file path, vector index to remove | (output_path, removed_idx, remaining) |
-| `turboquant_search(index_path, query_str, k)` | .tv file path, query as `'[f1,f2,...]'` string, top-k | (idx, score) |
-| `turboquant_search_ivf(index_dir, query_str, k, probes)` | IVF dir path, query string, top-k, num probes (0=all) | (idx, score) |
-| `turboquant_score(index_path, query_str)` | .tv file path, query as `'[f1,f2,...]'` string | (idx, score) — all vectors, sorted DESC |
+| `turboquant_search(index_path, query_str, k)` | .tv file path, query `[f1,f2,...]`, top-k | (idx, score) |
+| `turboquant_search_ivf(index_dir, query_str, k, probes)` | IVF dir path, query string, top-k, probes (0=all) | (idx, score) |
+| `turboquant_score(index_path, query_str)` | .tv file path, query `[f1,f2,...]` | (idx, score) — all vectors, sorted DESC |
 
 > **Note:** DuckDB table functions do not accept subquery parameters. Use `SET VARIABLE` + `getvariable()` to pass computed values from tables (see Quickstart Method 1).
 
