@@ -5,10 +5,10 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXTENSION_NAME=turbovec
 
 # Set to 1 to enable Unstable API
-USE_UNSTABLE_C_API=1
+USE_UNSTABLE_C_API=0
 
 # Target DuckDB C API version
-TARGET_DUCKDB_VERSION=v1.5.5
+TARGET_DUCKDB_VERSION=v1.5.4
 
 # Skip tests for now — add SQLLogicTest files later
 SKIP_TESTS=1
