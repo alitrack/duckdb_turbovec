@@ -18,28 +18,27 @@ docs:
   hello_world: |
     LOAD turbovec;
 
-    -- Create a vector index from embeddings
-    CREATE TABLE vecs AS
-    SELECT range AS id, array_cosine_similarity(range) AS embedding_len
-    FROM (SELECT range, [random(), random(), random()] AS embedding FROM range(1000));
+    -- Build a compressed vector index (8-dim vectors, 3 sub-vectors)
+    SELECT * FROM turboquant_build_list(
+      [0.0::FLOAT,1.0,2.0,3.0,4.0,5.0,6.0,7.0],
+      3, 'my_index'
+    );
 
-    -- Build IVF index
-    SELECT turbovec_build_index('vecs', 'embedding', 'id', nlist := 10);
+    -- Add a vector
+    SELECT * FROM turboquant_add(
+      [8.0::FLOAT,9.0,10.0,11.0,12.0,13.0,14.0,15.0],
+      'my_index'
+    );
 
     -- Search nearest neighbors
-    SELECT id, distance
-    FROM turbovec_search('vecs', 'embedding', [0.5, 0.3, 0.8], k := 5)
-    ORDER BY distance;
+    SELECT * FROM turboquant_search('my_index', 'l2', 3);
 
-    -- Incremental updates
-    INSERT INTO vecs VALUES (1001, [0.1, 0.2, 0.3]);
-    SELECT turbovec_update_index('vecs', 'embedding', 'id');
+    -- Build concatenated indexes
+    SELECT * FROM turboquant_build_concat('my_index', 'my_index', 'union');
 
-    -- Different distance metrics
-    SELECT id, distance FROM turbovec_search(
-      'vecs', 'embedding', [0.5, 0.3, 0.8],
-      k := 10, metric := 'cosine'
-    );
+    -- Build IVF index for faster search
+    SELECT * FROM turboquant_build_ivf('my_index', 10, 'ivf_index', 'l2');
+    SELECT * FROM turboquant_search_ivf('ivf_index', 'l2', [0.5,1.5,2.5,3.5,4.5,5.5,6.5,7.5]::FLOAT[], 3);
 
   extended_description: |
     ## turbovec — Compressed Vector Search for DuckDB
@@ -47,30 +46,30 @@ docs:
     High-performance approximate nearest neighbor (ANN) search using
     Google's TurboQuant for product quantization and IVF indexing.
 
-    **Features:**
-    - **Vector compression** via TurboQuant (product quantization)
-    - **IVF index** with configurable nlist (cluster count)
-    - **Incremental CRUD** — insert, update, delete vectors without rebuilding
-    - **Multiple metrics:** cosine, L2 (euclidean), dot product
-    - **Scalar quantization** option for precision/speed tradeoff
-    - **Configurable nprobe** for recall/speed tradeoff
-
-    **Functions:**
+    **9 Functions:**
 
     | Function | Description |
     |----------|-------------|
-    | `turbovec_build_index(table, vec_col, id_col, nlist, metric, ...)` | Build IVF+PQ index |
-    | `turbovec_search(table, vec_col, query_vec, k, metric, nprobe)` | Search nearest neighbors |
-    | `turbovec_update_index(table, vec_col, id_col)` | Incremental update |
-    | `turbovec_delete_from_index(table, id)` | Remove vectors |
-    | `turbovec_index_info(table)` | Index statistics |
-    | `turbovec_drop_index(table)` | Remove index |
-    | `turbovec_list_indexes()` | List all indexes |
+    | `turboquant_build_list(FLOAT[], INT, VARCHAR)` | Build index from vector list |
+    | `turboquant_build(FLOAT[], FLOAT[], FLOAT[], INT, VARCHAR)` | Build from separate batches |
+    | `turboquant_add(FLOAT[], VARCHAR)` | Add single vector |
+    | `turboquant_remove(INT, VARCHAR)` | Remove vector |
+    | `turboquant_search(VARCHAR, VARCHAR, INT)` | Search (l2/cosine/dot) |
+    | `turboquant_score(FLOAT[], VARCHAR)` | Score a query vector |
+    | `turboquant_build_concat(VARCHAR, VARCHAR, VARCHAR)` | Merge indexes |
+    | `turboquant_build_ivf(VARCHAR, INT, VARCHAR, VARCHAR)` | Build IVF index |
+    | `turboquant_search_ivf(VARCHAR, VARCHAR, FLOAT[], INT)` | IVF search |
+
+    **Features:**
+    - **Vector compression** via TurboQuant (product quantization)
+    - **IVF index** with configurable nlist
+    - **Multiple metrics:** l2, cosine, dot
+    - **Incremental** add/remove without full rebuild
+    - **Index concatenation** for merging datasets
 
     **Performance:**
     - 10-100× compression vs raw vectors
     - Sub-millisecond search on million-scale datasets
-    - Memory-efficient: index fits in RAM alongside DuckDB
 
     **Platforms:** Linux x64, macOS arm64/x64.
     Windows and WASM excluded (OpenBLAS dependency).
