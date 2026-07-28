@@ -1,0 +1,78 @@
+extension:
+  name: turbovec
+  description: "Compressed vector search for DuckDB — Google TurboQuant quantization, IVF indexing, incremental CRUD, cosine/L2/dot"
+  version: 0.3.0
+  language: Rust
+  build: cargo
+  license: MIT
+  requires_toolchains: rust
+  maintainers:
+    - alitrack
+  excluded_platforms: "linux_arm64;wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+
+repo:
+  github: alitrack/duckdb_turbovec
+  ref: refs/tags/v0.3.0
+
+docs:
+  hello_world: |
+    LOAD turbovec;
+
+    -- Create a vector index from embeddings
+    CREATE TABLE vecs AS
+    SELECT range AS id, array_cosine_similarity(range) AS embedding_len
+    FROM (SELECT range, [random(), random(), random()] AS embedding FROM range(1000));
+
+    -- Build IVF index
+    SELECT turbovec_build_index('vecs', 'embedding', 'id', nlist := 10);
+
+    -- Search nearest neighbors
+    SELECT id, distance
+    FROM turbovec_search('vecs', 'embedding', [0.5, 0.3, 0.8], k := 5)
+    ORDER BY distance;
+
+    -- Incremental updates
+    INSERT INTO vecs VALUES (1001, [0.1, 0.2, 0.3]);
+    SELECT turbovec_update_index('vecs', 'embedding', 'id');
+
+    -- Different distance metrics
+    SELECT id, distance FROM turbovec_search(
+      'vecs', 'embedding', [0.5, 0.3, 0.8],
+      k := 10, metric := 'cosine'
+    );
+
+  extended_description: |
+    ## turbovec — Compressed Vector Search for DuckDB
+
+    High-performance approximate nearest neighbor (ANN) search using
+    Google's TurboQuant for product quantization and IVF indexing.
+
+    **Features:**
+    - **Vector compression** via TurboQuant (product quantization)
+    - **IVF index** with configurable nlist (cluster count)
+    - **Incremental CRUD** — insert, update, delete vectors without rebuilding
+    - **Multiple metrics:** cosine, L2 (euclidean), dot product
+    - **Scalar quantization** option for precision/speed tradeoff
+    - **Configurable nprobe** for recall/speed tradeoff
+
+    **Functions:**
+
+    | Function | Description |
+    |----------|-------------|
+    | `turbovec_build_index(table, vec_col, id_col, nlist, metric, ...)` | Build IVF+PQ index |
+    | `turbovec_search(table, vec_col, query_vec, k, metric, nprobe)` | Search nearest neighbors |
+    | `turbovec_update_index(table, vec_col, id_col)` | Incremental update |
+    | `turbovec_delete_from_index(table, id)` | Remove vectors |
+    | `turbovec_index_info(table)` | Index statistics |
+    | `turbovec_drop_index(table)` | Remove index |
+    | `turbovec_list_indexes()` | List all indexes |
+
+    **Performance:**
+    - 10-100× compression vs raw vectors
+    - Sub-millisecond search on million-scale datasets
+    - Memory-efficient: index fits in RAM alongside DuckDB
+
+    **Platforms:** Linux x64, macOS arm64/x64.
+    Windows and WASM excluded (OpenBLAS dependency).
+
+    Built on Google's [TurboQuant](https://github.com/google/turbovec) library.
