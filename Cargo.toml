@@ -24,6 +24,5 @@ duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] 
 turbovec = "0.9"
 arrow = "58"
 
-# Pure-Rust replacement for cblas-sys — eliminates need for system OpenBLAS
-[patch.crates-io]
-cblas-sys = { path = "crates/cblas-stub" }
+[build-dependencies]
+cc = "1"
