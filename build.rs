@@ -1,8 +1,7 @@
 fn main() {
-    // Build a stub static library that provides CBLAS symbols.
-    // This prevents the need for system libopenblas.
+    // Build a stub static library named 'openblas' that provides CBLAS symbols.
+    // cblas-sys's build.rs adds `-lopenblas` — we satisfy it with our own stub.
     cc::Build::new()
         .file("src/cblas_stub.c")
-        .compile("cblas_stub");
-    println!("cargo:rustc-link-lib=static=cblas_stub");
+        .compile("openblas");
 }
