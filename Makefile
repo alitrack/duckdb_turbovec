@@ -19,17 +19,7 @@ all: configure debug
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
-# Install system deps (OpenBLAS for turbovec faer/ndarray)
-install_system_deps:
-	@if [ -x /usr/bin/yum ]; then \
-		for i in 1 2 3; do /usr/bin/yum install -y openblas-devel && break; done; \
-	elif [ -x /usr/bin/apt-get ]; then \
-		apt-get update -qq && apt-get install -y libopenblas-dev; \
-	elif [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; then \
-		brew install openblas; \
-	fi || true
-
-configure: install_system_deps venv platform extension_version
+configure: venv platform extension_version
 
 debug: build_extension_library_debug build_extension_with_metadata_debug
 release: build_extension_library_release build_extension_with_metadata_release
