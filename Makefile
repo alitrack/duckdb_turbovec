@@ -10,9 +10,6 @@ USE_UNSTABLE_C_API=0
 # Target DuckDB C API version
 TARGET_DUCKDB_VERSION=v1.5.4
 
-# Skip OpenBLAS tests when building from source (openblas-src)
-export OPENBLAS_MAKE_TARGET = libs
-
 # Skip tests for now — add SQLLogicTest files later
 SKIP_TESTS=1
 
