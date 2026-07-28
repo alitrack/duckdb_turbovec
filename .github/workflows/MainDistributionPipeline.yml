@@ -48,7 +48,7 @@ jobs:
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install build deps
+      - name: Install build tools
         run: brew install ninja openblas
       - name: Configure
         run: make configure

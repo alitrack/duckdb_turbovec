@@ -22,7 +22,9 @@ crate-type = ["staticlib"]
 [dependencies]
 duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] }
 turbovec = "0.9"
-# Build OpenBLAS from source and statically link it — avoids needing
-# system libopenblas-dev in the Docker distribution image.
-openblas-src = { version = "0.10", features = ["static", "cblas"] }
 arrow = "58"
+
+# Build OpenBLAS from source on Linux (Docker CI lacks system libopenblas-dev).
+# On macOS, brew installs pre-built openblas.
+[target.'cfg(target_os = "linux")'.dependencies]
+openblas-src = { version = "0.10", features = ["static", "cblas"] }
