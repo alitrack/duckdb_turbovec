@@ -11,17 +11,17 @@ pub unsafe extern "C" fn cblas_dgemm(
     b: *const f64, ldb: i32,
     beta: f64, c: *mut f64, ldc: i32,
 ) {
+    if m <= 0 || n <= 0 || k <= 0 { return; }
     let (m, n, k) = (m as usize, n as usize, k as usize);
-    if m == 0 || n == 0 || k == 0 { return; }
-    let l1 = lda as usize;
-    let l2 = ldb as usize;
-    let l3 = ldc as usize;
+    let (lda, ldb, ldc) = (lda as usize, ldb as usize, ldc as usize);
+    let max_a = if k > lda { k * lda } else { m * k };
+    let max_b = if n > ldb { n * ldb } else { k * n };
+    let max_c = m * n;
     unsafe {
-        dgemm(m, k, n, alpha,
-            std::slice::from_raw_parts(a, m * l1.max(k)), l1, 1,
-            std::slice::from_raw_parts(b, k * l2.max(n)), l2, 1,
-            beta,
-            std::slice::from_raw_parts_mut(c, m * l3.max(n)), l3, 1);
+        let a_slice = std::slice::from_raw_parts(a, max_a);
+        let b_slice = std::slice::from_raw_parts(b, max_b);
+        let c_slice = std::slice::from_raw_parts_mut(c, max_c);
+        dgemm(m, k, n, alpha, a_slice, lda, 1, b_slice, ldb, 1, beta, c_slice, ldc, 1);
     }
 }
 
