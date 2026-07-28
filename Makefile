@@ -21,9 +21,13 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
 # Install system deps (OpenBLAS for turbovec faer/ndarray)
 install_system_deps:
-	{ command -v yum >/dev/null && yum install -y openblas-devel || yum install -y openblas-devel || yum install -y openblas-devel; } || \
-	 { command -v apt-get >/dev/null && apt-get update -qq && apt-get install -y libopenblas-dev; } || \
-	 { command -v brew >/dev/null && brew install openblas; } || true
+	@if [ -x /usr/bin/yum ]; then \
+		for i in 1 2 3; do /usr/bin/yum install -y openblas-devel && break; done; \
+	elif [ -x /usr/bin/apt-get ]; then \
+		apt-get update -qq && apt-get install -y libopenblas-dev; \
+	elif [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; then \
+		brew install openblas; \
+	fi || true
 
 configure: install_system_deps venv platform extension_version
 
