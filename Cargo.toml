@@ -22,6 +22,7 @@ crate-type = ["staticlib"]
 [dependencies]
 duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] }
 turbovec = "0.9"
-# ndarray pulls in cblas-sys unconditionally -> requires system openblas.
-# Linux Docker CI image lacks it, so linux_amd64 is excluded from distribution.
+# Build OpenBLAS from source and statically link it — avoids needing
+# system libopenblas-dev in the Docker distribution image.
+openblas-src = { version = "0.10", features = ["static", "cblas"] }
 arrow = "58"
