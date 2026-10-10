@@ -1,0 +1,15 @@
+{
+  "name": "duckdb-turbovec",
+  "owner": {
+    "name": "alitrack",
+    "url": "https://github.com/alitrack"
+  },
+  "plugins": [
+    {
+      "name": "duckdb-turbovec",
+      "description": "Verified SQL knowledge for the turbovec DuckDB extension: TurboQuant compressed vector search (flat + IVF), 8-16x compression, zero training, pure SQL ANN",
+      "source": "./duckdb-turbovec",
+      "category": "data"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "duckdb-turbovec",
+  "version": "0.3.3",
+  "description": "Verified knowledge for the turbovec DuckDB extension: building flat and IVF TurboQuant indexes, top-k search, incremental add/remove, and score semantics.",
+  "author": {
+    "name": "alitrack"
+  },
+  "homepage": "https://github.com/alitrack/duckdb_turbovec"
+}
