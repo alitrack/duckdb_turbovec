@@ -1146,11 +1146,141 @@ impl VTab for TurboQuantBuildConcatVTab {
     }
 }
 
+// ── turboquant_search_within(index_path, query_str, eps, k) ──
+// Radius (WITHIN) counterpart to turboquant_search: instead of "the k
+// nearest", return every vector whose (approximate quantized) similarity
+// score is within `eps` of the best (nearest) result — i.e. everything as
+// close to the query as the nearest neighbor, within tolerance eps.
+// `k` caps the output (0 = no cap); passing k>0 fuses top-k with the radius
+// bound (returns the k nearest that are within eps).
+//
+// NOTE: scores are approximate quantized similarity (higher = nearer,
+// best-first), so `eps` is a score gap in the index's own units and the
+// bound is approximate (like pgvector's HNSW radius). Calibrate eps
+// empirically per index; it is not comparable across engines.
+
+#[repr(C)]
+pub struct WithinInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+pub struct WithinBindData {
+    results: Vec<(i32, f32)>,
+    schema: Arc<arrow::datatypes::Schema>,
+}
+
+pub struct TurboQuantSearchWithinVTab;
+
+impl VTab for TurboQuantSearchWithinVTab {
+    type BindData = WithinBindData;
+    type InitData = WithinInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let pc = bind.get_parameter_count();
+        if pc < 4 {
+            return Err(
+                "turboquant_search_within: expected 4 params (path, query_str, eps, k)".into(),
+            );
+        }
+        let path = bind.get_parameter(0).to_string();
+        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
+        let eps: f32 = bind
+            .get_parameter(2)
+            .to_string()
+            .parse()
+            .map_err(|_| "turboquant_search_within: eps must be a number")?;
+        let k: usize = bind
+            .get_parameter(3)
+            .to_string()
+            .parse()
+            .map_err(|_| "turboquant_search_within: k must be a non-negative integer")?;
+
+        let idx = TurboQuantIndex::load(&path)
+            .map_err(|e| format!("turboquant_search_within: {e}"))?;
+        let n = idx.len();
+
+        let mut results = Vec::new();
+        if n > 0 {
+            // Full scan. TurboQuant's search() is not guaranteed to emit
+            // results in strictly score-descending order, so we cannot
+            // early-break on the first below-threshold row. Instead collect
+            // every vector whose score is within eps of the best, then sort
+            // by score (best-first) and apply the k cap — giving "the k
+            // nearest that are within eps" (top-k + radius fused).
+            let sr = idx.search(&query, n);
+            let best = sr.scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let threshold = best - eps;
+            for j in 0..sr.indices.len() {
+                if sr.scores[j] >= threshold {
+                    results.push((sr.indices[j] as i32, sr.scores[j]));
+                }
+            }
+            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            if k > 0 {
+                results.truncate(k);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("idx", DataType::Int32, false),
+            Field::new("score", DataType::Float32, false),
+        ]));
+        bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
+        Ok(WithinBindData { results, schema })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(WithinInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        let bind = func.get_bind_data();
+        let n = bind.results.len().min(2048);
+        if n == 0 {
+            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            output.set_len(0);
+            return Ok(());
+        }
+        let indices: Vec<i32> = bind.results.iter().take(n).map(|r| r.0).collect();
+        let scores: Vec<f32> = bind.results.iter().take(n).map(|r| r.1).collect();
+        let batch = RecordBatch::try_new(
+            bind.schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(indices)),
+                Arc::new(Float32Array::from(scores)),
+            ],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Double),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+}
+
 // ── Entrypoint ──
 
 #[duckdb_entrypoint_c_api(ext_name = "turbovec")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<TurboQuantSearchVTab>("turboquant_search")?;
+    con.register_table_function::<TurboQuantSearchWithinVTab>("turboquant_search_within")?;
     con.register_table_function::<TurboQuantScoreVTab>("turboquant_score")?;
     con.register_table_function::<TurboQuantBuildVTab>("turboquant_build")?;
     con.register_table_function::<TurboQuantBuildListVTab>("turboquant_build_list")?;

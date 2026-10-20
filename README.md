@@ -38,6 +38,11 @@ SELECT * FROM turboquant_search_ivf('/tmp/myivf/', '[0.1, 0.2, ...]', 10, 8);
 -- Full scoring — all vectors ranked by similarity
 SELECT * FROM turboquant_score('/tmp/myidx.tv', '[0.1, 0.2, ...]');
 -- → (idx INT, score FLOAT) — every vector in the index, sorted by score DESC
+
+-- Radius (WITHIN) search — everything within `eps` of the nearest, optional k cap
+SELECT * FROM turboquant_search_within('/tmp/myidx.tv', '[0.1, 0.2, ...]', 0.05, 0);
+-- → (idx INT, score FLOAT) — all vectors whose score is within eps of the top-1,
+--   sorted best-first; k=0 = no cap, k>0 = top-k fused with the radius bound
 ```
 
 ## SQL API
@@ -51,6 +56,7 @@ SELECT * FROM turboquant_score('/tmp/myidx.tv', '[0.1, 0.2, ...]');
 | `turboquant_add(index_path, vectors_str, dim)` | existing .tv path, nested array string, dim | (output_path, added, total) |
 | `turboquant_remove(index_path, idx)` | .tv file path, vector index to remove | (output_path, removed_idx, remaining) |
 | `turboquant_search(index_path, query_str, k)` | .tv file path, query `[f1,f2,...]`, top-k | (idx, score) |
+| `turboquant_search_within(index_path, query_str, eps, k)` | .tv file path, query `[f1,f2,...]`, score-epsilon, cap (0=none) | (idx, score) — all within `eps` of nearest, best-first; k>0 = top-k+radius fused |
 | `turboquant_search_ivf(index_dir, query_str, k, probes)` | IVF dir path, query string, top-k, probes (0=all) | (idx, score) |
 | `turboquant_score(index_path, query_str)` | .tv file path, query `[f1,f2,...]` | (idx, score) — all vectors, sorted DESC |
 
@@ -96,6 +102,7 @@ Requires DuckDB CLI and `turbovec.duckdb_extension` built in the project root.
 - IVF index with K-means partitioning for sub-linear search at scale
 - Incremental add/remove (`turboquant_add` / `turboquant_remove`)
 - IVF auto-probe (`probes=0` → full scan)
+- Radius (WITHIN) search (`turboquant_search_within`) — everything within `eps` of the nearest, optional top-k cap
 
 ## Roadmap
 
@@ -104,14 +111,16 @@ Requires DuckDB CLI and `turbovec.duckdb_extension` built in the project root.
 - [x] `turboquant_score()` — all-vector scoring
 - [x] `turboquant_build_list()` — build from flat `LIST<FLOAT>` with auto dim detection
 - [x] `turboquant_build_ivf()` / `turboquant_search_ivf()` — IVF index with K-means routing
+- [x] `turboquant_search_within()` — radius (WITHIN) / top-k+eps fused search
 - [x] macOS ARM + Linux x86_64 + Windows x86_64 CI
-- [x] Integration test suite (16 tests)
+- [x] Integration test suite (26 tests)
 - [ ] DuckDB Community Extension submission
 
 ## Known Limitations
 
 - DuckDB table functions reject subquery parameters. Use `SET VARIABLE name = (...)` + `getvariable('name')` to pass computed values.
 - Scores are quantized approximations, not exact cosine. Self-vectors may not score highest for very small indices.
+- `turboquant_search_within` `eps` is a **score gap in the index's own quantized units** (not a cosine/distance distance). Calibrate it per index from the score spread (e.g. via `turboquant_score`); it is not comparable across engines or metrics.
 - IVF indices are immutable at the cluster level (no per-cluster add/remove). Use flat index `turboquant_add`/`turboquant_remove` for incremental CRUD.
 
 ## License

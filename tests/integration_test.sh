@@ -130,6 +130,37 @@ SELECT COUNT(*) FROM turboquant_search('$IDX_LIST', '[0.1,0.2,0.3,0.4,0.5,0.6,0.
 OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
 echo "$OUT" | grep -q "2" && pass "search from LIST index" || fail "search list" "$OUT"
 
+# ── Test: turboquant_search_within (radius / WITHIN) ──
+IDX_W="$TMPDIR/test_within.tv"
+VECS_W='[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0]]'
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT * FROM turboquant_build('${VECS_W}', 8, 4, '$IDX_W');
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "4" && pass "within: build 4-vector index" || fail "within build" "$OUT"
+# eps=0 -> exactly the single nearest (top-1), a 1..6-style prefix of len 1
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT COUNT(*) FROM turboquant_search_within('$IDX_W', '[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]', 0, 0);
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "1" && pass "within: eps=0 returns top-1 only" || fail "within eps=0" "$OUT"
+# huge eps + k=0 -> all 4 vectors
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT COUNT(*) FROM turboquant_search_within('$IDX_W', '[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]', 1e18, 0);
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "4" && pass "within: huge eps returns all 4" || fail "within huge eps" "$OUT"
+# huge eps + k=2 -> capped at 2
+SQL="
+LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
+SELECT COUNT(*) FROM turboquant_search_within('$IDX_W', '[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]', 1e18, 2);
+"
+OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
+echo "$OUT" | grep -q "2" && pass "within: k=2 cap returns 2" || fail "within k cap" "$OUT"
+
 # ── Test: IVF build ──
 IVF_DIR="$TMPDIR/ivf_test"
 VECS='[[0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80],[0.11,0.21,0.31,0.41,0.51,0.61,0.71,0.81],[0.12,0.22,0.32,0.42,0.52,0.62,0.72,0.82],[0.13,0.23,0.33,0.43,0.53,0.63,0.73,0.83],[0.50,0.50,0.50,0.50,0.50,0.50,0.50,0.50],[0.51,0.51,0.51,0.51,0.51,0.51,0.51,0.51],[0.52,0.52,0.52,0.52,0.52,0.52,0.52,0.52],[0.53,0.53,0.53,0.53,0.53,0.53,0.53,0.53],[0.90,0.90,0.90,0.90,0.90,0.90,0.90,0.90],[0.91,0.91,0.91,0.91,0.91,0.91,0.91,0.91],[0.92,0.92,0.92,0.92,0.92,0.92,0.92,0.92],[0.93,0.93,0.93,0.93,0.93,0.93,0.93,0.93]]'
