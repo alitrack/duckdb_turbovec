@@ -5,7 +5,9 @@ use arrow::{
 use duckdb::{
     core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
     duckdb_entrypoint_c_api,
+    vscalar::{ScalarFunctionSignature, VScalar},
     vtab::{arrow::record_batch_to_duckdb_data_chunk, BindInfo, InitInfo, TableFunctionInfo, VTab},
+    vtab::arrow::WritableVector,
     Connection, Result,
 };
 use std::{error::Error, sync::Arc};
@@ -1307,13 +1309,29 @@ impl VTab for IvfFilterSearchVTab {
         }
         filter_ids.sort_unstable();
         filter_ids.dedup();
-        let max_probes: usize = if pc >= 5 {
-            let mp: usize = bind.get_parameter(4).to_string().parse().unwrap_or(0);
-            if mp == 0 { usize::MAX } else { mp }
-        } else { usize::MAX };
-        let rerank_factor: usize = if pc >= 6 {
-            bind.get_parameter(5).to_string().parse().unwrap_or(0)
-        } else { 0 };
+        // knob defaults: explicit named args win; else turbovec_config() values
+        let knob = |name: &str| -> Option<i64> {
+            config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .copied()
+        };
+        let named_int = |bind: &BindInfo, name: &str| -> Option<i64> {
+            bind.get_named_parameter(name)
+                .and_then(|v| v.to_string().parse::<i64>().ok())
+        };
+        let max_probes: usize = match named_int(bind, "max_probes") {
+            Some(mp) if mp > 0 => mp as usize,
+            _ => match knob("ivf_default_max_probes") {
+                Some(v) if v > 0 => v as usize,
+                _ => usize::MAX,
+            },
+        };
+        let rerank_factor: usize = match named_int(bind, "rerank_factor") {
+            Some(rf) if rf > 0 => rf as usize,
+            _ => knob("ivf_default_rerank_factor").unwrap_or(0).max(0) as usize,
+        };
 
         // V2 single-index layout only (v1 legacy has no slot table to intersect)
         let meta2_path = format!("{dir}/meta2.bin");
@@ -1452,13 +1470,21 @@ impl VTab for IvfFilterSearchVTab {
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // positional: index_dir, query, k, filter_ids
+        // named (optional): max_probes, rerank_factor — fall back to
+        // turbovec_config() knobs when omitted
         Some(vec![
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
             LogicalTypeHandle::from(LogicalTypeId::Integer),
             LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Bigint)), // filter_ids LIST<BIGINT>
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        Some(vec![
+            ("max_probes".to_string(), LogicalTypeHandle::from(LogicalTypeId::Integer)),
+            ("rerank_factor".to_string(), LogicalTypeHandle::from(LogicalTypeId::Integer)),
         ])
     }
 }
@@ -1855,6 +1881,109 @@ impl VTab for TurboQuantSearchWithinVTab {
     }
 }
 
+// ── Session knobs (process-wide config store) ─────────────────────────────
+// The bundled duckdb-rs 1.10504 predates the C config-option API, so SET is
+// not available; this scalar function is the equivalent knob surface:
+//   SELECT turbovec_config('ivf_default_probes', 8)   -- set
+//   SELECT turbovec_config('ivf_default_probes')      -- get (NULL = unset)
+//   SELECT turbovec_config('', NULL)                  -- reset all
+// Knobs act as DEFAULTS: explicit function arguments always win.
+
+fn config_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, i64>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Known knob names (validated on set; unknown keys are accepted for
+/// forward-compat but read back as NULL after a restart).
+const KNOBS: &[&str] = &[
+    "ivf_default_probes",     // default probes for search_ivf / ivf_filter
+    "ivf_default_max_probes", // default cap for ivf_filter iterative widening
+    "ivf_default_rerank_factor", // default rerank multiplier for ivf_filter
+];
+
+struct TurboVecConfig;
+
+impl VScalar for TurboVecConfig {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use duckdb::ffi as ffi;
+        let len = input.len();
+        // col0: VARCHAR key
+        let key_v = input.flat_vector(0);
+        let keys: &[ffi::duckdb_string_t] =
+            unsafe { key_v.as_slice_with_len(len) };
+        // 1-arg overload = get, 2-arg = set
+        let is_set = input.num_columns() >= 2;
+        let val_v = input.flat_vector(1);
+        let vals: &[i64] = unsafe { val_v.as_slice_with_len(len) };
+        let val_null = |row: usize| val_v.row_is_null(row as u64);
+
+        let mut out = output.flat_vector();
+        let dst: &mut [i64] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut i64, len) };
+
+        let mut store = config_store().lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for row in 0..len {
+            let key_len = unsafe { ffi::duckdb_string_t_length(keys[row]) };
+            let key_ptr = unsafe { ffi::duckdb_string_t_data(&keys[row] as *const _ as *mut _) };
+            let key_bytes = unsafe { std::slice::from_raw_parts(key_ptr as *const u8, key_len as usize) };
+            let key = String::from_utf8_lossy(key_bytes).into_owned();
+
+            if key.is_empty() {
+                // turbovec_config('', NULL) → reset all knobs
+                store.clear();
+                out.set_null(row);
+                continue;
+            }
+
+            if !is_set || val_null(row) {
+                // get: prior value or NULL (set_null below)
+                match store.get(&key) {
+                    Some(v) => dst[row] = *v,
+                    None => out.set_null(row),
+                }
+            } else {
+                // set: validate knob name, store, echo value
+                // NOTE: the bundled C API has no SetFallible, so an unknown
+                // knob cannot raise; signal with NULL instead.
+                if !KNOBS.contains(&key.as_str()) {
+                    out.set_null(row);
+                    continue;
+                }
+                store.insert(key, vals[row]);
+                dst[row] = vals[row];
+            }
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            // get: turbovec_config(key) -> BIGINT (NULL when unset)
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ),
+            // set: turbovec_config(key, value) -> BIGINT (echoes value)
+            ScalarFunctionSignature::exact(
+                vec![
+                    LogicalTypeHandle::from(LogicalTypeId::Varchar),
+                    LogicalTypeHandle::from(LogicalTypeId::Bigint),
+                ],
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ),
+        ]
+    }
+}
+
 // ── Entrypoint ──
 
 #[duckdb_entrypoint_c_api(ext_name = "turbovec")]
@@ -1872,6 +2001,7 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_table_function::<IvfFilterSearchVTab>("turboquant_search_ivf_filter")?;
     con.register_table_function::<EnsembleBuildVTab>("turboquant_build_ensemble")?;
     con.register_table_function::<EnsembleSearchVTab>("turboquant_search_ensemble")?;
+    con.register_scalar_function::<TurboVecConfig>("turbovec_config")?;
     Ok(())
 }
 
