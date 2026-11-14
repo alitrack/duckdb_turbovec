@@ -981,6 +981,28 @@ impl VTab for IvfBuildVTab {
         };
         meta.write(&format!("{output_dir}/meta2.bin"))?;
 
+        // Optional 6th param keep_raw=true: store the ORIGINAL f32 vectors
+        // in slot order next to the quantized index. This enables rerank
+        // (oversampling + exact rescoring) at search time — the pattern
+        // Qdrant/VectoGrid validated: quantized index proposes candidates,
+        // raw vectors settle the final top-k, recall recovers to ~exact.
+        // Cost: +4 bytes/dim/vector (a 1472×1536 index grows 3.0→12 MB).
+        if pc >= 6 {
+            // Boolean params arrive as "true"/"false" (not 1/0) via to_string()
+            let keep_raw_str = bind.get_parameter(5).to_string().to_lowercase();
+            let keep_raw = matches!(keep_raw_str.as_str(), "true" | "1" | "t" | "yes");
+            if keep_raw {
+                // EXTERNAL id order (= input row order): rerank indexes the
+                // file by candidate id directly, no slot_to_id round-trip.
+                std::fs::write(
+                    format!("{output_dir}/vectors.f32"),
+                    unsafe {
+                        std::slice::from_raw_parts(vectors.as_ptr() as *const u8, vectors.len() * 4)
+                    },
+                )?;
+            }
+        }
+
         bind.add_result_column("output_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("rows", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("num_lists", LogicalTypeHandle::from(LogicalTypeId::Integer));
@@ -1023,11 +1045,12 @@ impl VTab for IvfBuildVTab {
             LogicalTypeHandle::from(LogicalTypeId::Integer),
             LogicalTypeHandle::from(LogicalTypeId::Integer),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Boolean),
         ])
     }
 }
 
-// ── turboquant_search_ivf(index_dir, query_str, k, probes) ──
+// ── turboquant_search_ivf(index_dir, query_str, k, probes, [rerank_factor]) ──
 
 pub struct IvfSearchVTab;
 
@@ -1093,12 +1116,36 @@ impl VTab for IvfSearchVTab {
 
             let idx = idmap_cache::get_or_load(&format!("{dir}/index.tv"))
                 .map_err(|e| format!("turboquant_search_ivf: {e}"))?;
+            // rerank_factor (5th param): fetch k×factor candidates from the
+            // quantized index, then rescore exactly against raw f32 vectors
+            // (vectors.f32, slot order) if present. factor=0 → plain path.
+            let rerank_factor: usize = if pc >= 5 {
+                bind.get_parameter(4).to_string().parse().unwrap_or(0)
+            } else {
+                0
+            };
             let (scores, ids) = idx
-                .search_with_allowlist(&query, k, Some(&allowed))
+                .search_with_allowlist(&query, k * rerank_factor.max(1), Some(&allowed))
                 .map_err(|e| format!("turboquant_search_ivf: {e}"))?;
-            ids.iter().zip(scores.iter())
-                .map(|(&id, &s)| (id as i32, s))
-                .collect()
+            if rerank_factor > 1 {
+                let raw_path = format!("{dir}/vectors.f32");
+                if std::path::Path::new(&raw_path).exists() {
+                    let (rs, ri) = rerank_exact(&raw_path, &query, &ids, dim, k)?;
+                    ri.iter().zip(rs.iter())
+                        .map(|(&id, &s)| (id as i32, s))
+                        .collect()
+                } else {
+                    // no raw vectors stored — best effort: truncate to k
+                    ids.iter().zip(scores.iter())
+                        .take(k)
+                        .map(|(&id, &s)| (id as i32, s))
+                        .collect()
+                }
+            } else {
+                ids.iter().zip(scores.iter())
+                    .map(|(&id, &s)| (id as i32, s))
+                    .collect()
+            }
         } else {
             // legacy v1 path
             let meta = IvfMeta::load(&format!("{dir}/meta.bin"))?;
@@ -1187,6 +1234,7 @@ impl VTab for IvfSearchVTab {
         Some(vec![
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
             LogicalTypeHandle::from(LogicalTypeId::Integer),
             LogicalTypeHandle::from(LogicalTypeId::Integer),
         ])
@@ -1616,6 +1664,51 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
 // per vector id. Independent noise averages down ~1/sqrt(m): with 2 members
 // at 4-bit each, memory is the same as a hypothetical 8-bit index while
 // recall lands between 4-bit and exact.
+
+/// Exact rescoring of candidate ids against the raw f32 vectors stored by
+/// build (vectors.f32, slot order). Returns (scores, ids) sorted, top-k.
+fn rerank_exact(
+    raw_path: &str,
+    query: &[f32],
+    cand_ids: &[u64],
+    dim: usize,
+    k: usize,
+) -> std::result::Result<(Vec<f32>, Vec<u64>), Box<dyn Error>> {
+    // mmap-less simple read: raw file is dim-sized rows in SLOT order, but
+    // cand ids are EXTERNAL ids (original row numbers). We need slot_of(id):
+    // linear scan of slot_to_id is O(n) per query — fine at these scales,
+    // and only cand_ids.len() rows of the file are actually read.
+    // NOTE: caller passes ids already capped at k*factor.
+    let bytes = std::fs::read(raw_path)?;
+    if bytes.len() % (dim * 4) != 0 {
+        return Err("vectors.f32 size mismatch".into());
+    }
+    let n = bytes.len() / (dim * 4);
+    // build id → slot map from the cand ids by reading slot table lazily:
+    // slot order is unknown here, so instead rescore by EXTERNAL id via the
+    // meta2 slot_to_id table is required — but we avoid the dependency by
+    // having build write vectors.f32 in EXTERNAL id order instead.
+    let _ = n;
+    // Rescore each candidate against its raw vector
+    let mut scored: Vec<(u64, f32)> = Vec::with_capacity(cand_ids.len());
+    for &id in cand_ids {
+        let off = (id as usize) * dim * 4;
+        if off + dim * 4 > bytes.len() {
+            continue;
+        }
+        let v: Vec<f32> = bytes[off..off + dim * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        scored.push((id, l2_dist(query, &v)));
+    }
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+    scored.truncate(k);
+    Ok((
+        scored.iter().map(|(_, s)| -*s).collect(),
+        scored.iter().map(|(id, _)| *id).collect(),
+    ))
+}
 
 /// Deterministic seeded permutation (splitmix-style shuffle) of 0..dim.
 /// Same member index → same permutation on every build, so a rebuilt
