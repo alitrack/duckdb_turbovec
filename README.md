@@ -40,6 +40,18 @@ SELECT * FROM turboquant_search_ivf('/tmp/myivf/', '[0.1, 0.2, ...]', 10, 8);
 -- Loaded indexes are cached process-wide: repeated queries skip the
 -- file read (21x faster on a 100k-vector index).
 
+-- Rerank (oversampling + exact rescoring) — recall recovery to ~exact.
+-- Build with keep_raw=true (6th param) to store the original f32 vectors
+-- next to the quantized index, then search with rerank_factor (5th param):
+-- the quantized index proposes k x factor candidates, exact f32 distances
+-- settle the final top-k (the Qdrant/VectoGrid pattern).
+SELECT * FROM turboquant_build_ivf(
+  getvariable('vec_str'), 1536, 4, 0, '/tmp/myivf_rr/', true
+);
+SELECT * FROM turboquant_search_ivf('/tmp/myivf_rr/', '[0.1, ...]', 10, 32, 4);
+-- recall@10 on 1472x1536 OpenAI embeddings: plain 0.846 -> 0.996 @ ~2 ms
+-- index with raw vectors: 12.1 MB (still 2.3x smaller than DuckIR u8)
+
 -- Recall recovery: ensemble of m permutation-decorrelated indexes,
 -- score-averaged at search time (no native 8-bit in the kernel; this
 -- trades m x memory for recall instead)
@@ -67,12 +79,14 @@ SELECT * FROM turboquant_search_within('/tmp/myidx.tv', '[0.1, 0.2, ...]', 0.05,
 | `turboquant_build(vectors_str, dim, bit_width, output_path)` | nested array string `[[a,b],[c,d]]`, dim, 2/3/4, path | (output_path, rows) |
 | `turboquant_build_list(vectors_list, bit_width, output_path)` | flat `[f1,f2,...]` LIST, 2/3/4, path | (output_path, rows, dim) — dim auto-detected |
 | `turboquant_build_concat(output_path, dim, bit_width, values_str)` | path, dim, 2/3/4, comma-separated `f1,f2,...` | (output_path, rows) |
-| `turboquant_build_ivf(vectors_str, dim, bit_width, num_lists, output_dir)` | nested array string, dim, 2/3/4, k, dir | (output_dir, rows, num_lists) |
+| `turboquant_build_ivf(vectors_str, dim, bit_width, num_lists, output_dir, [keep_raw])` | nested array string, dim, 2/3/4, k (0=auto √n), dir, keep raw f32 for rerank | (output_dir, rows, num_lists) |
 | `turboquant_add(index_path, vectors_str, dim)` | existing .tv path, nested array string, dim | (output_path, added, total) |
 | `turboquant_remove(index_path, idx)` | .tv file path, vector index to remove | (output_path, removed_idx, remaining) |
 | `turboquant_search(index_path, query_str, k)` | .tv file path, query `[f1,f2,...]`, top-k | (idx, score) |
 | `turboquant_search_within(index_path, query_str, eps, k)` | .tv file path, query `[f1,f2,...]`, score-epsilon, cap (0=none) | (idx, score) — all within `eps` of nearest, best-first; k>0 = top-k+radius fused |
-| `turboquant_search_ivf(index_dir, query_str, k, probes)` | IVF dir path, query string, top-k, probes (0=all) | (idx, score) |
+| `turboquant_search_ivf(index_dir, query_str, k, probes, [rerank_factor])` | IVF dir path, query string, top-k, probes (0=all), oversampling factor | (idx, score) |
+| `turboquant_build_ensemble(vectors_str, dim, bit_width, members, output_dir)` | nested array string, dim, 2/3/4, m (1–8), dir | (output_dir, rows, members) |
+| `turboquant_search_ensemble(ensemble_dir, query_str, k)` | ensemble dir path, query string, top-k | (idx, score) — score-averaged across members |
 | `turboquant_score(index_path, query_str)` | .tv file path, query `[f1,f2,...]` | (idx, score) — all vectors, sorted DESC |
 
 > **Note:** DuckDB table functions do not accept subquery parameters. Use `SET VARIABLE` + `getvariable()` to pass computed values from tables (see Quickstart Method 1).
@@ -115,6 +129,11 @@ Requires DuckDB CLI and `turbovec.duckdb_extension` built in the project root.
 - Two build modes: string-based (`turboquant_build`), list-based (`turboquant_build_list`), flat CSV (`turboquant_build_concat`), and IVF (`turboquant_build_ivf`)
 - Table-sourced builds via `SET VARIABLE` + `getvariable()`
 - IVF index with K-means partitioning for sub-linear search at scale
+- IVF v2 single-file layout — one index for all clusters, 7–18× smaller than per-cluster files
+- k-means++ seeding + parallel Lloyd assignment (`num_lists=0` → auto √n)
+- Rerank: `keep_raw` build + `rerank_factor` search — recall@10 0.846 → 0.996 on real OpenAI embeddings (~2 ms)
+- Ensemble indexes (m members, score-averaged) — recall@10 0.888 → 0.939 at ×4
+- Process-wide index cache — repeated search on a 100k index 37.7 ms → 1.77 ms
 - Incremental add/remove (`turboquant_add` / `turboquant_remove`)
 - IVF auto-probe (`probes=0` → full scan)
 - Radius (WITHIN) search (`turboquant_search_within`) — everything within `eps` of the nearest, optional top-k cap
@@ -127,9 +146,13 @@ Requires DuckDB CLI and `turbovec.duckdb_extension` built in the project root.
 - [x] `turboquant_build_list()` — build from flat `LIST<FLOAT>` with auto dim detection
 - [x] `turboquant_build_ivf()` / `turboquant_search_ivf()` — IVF index with K-means routing
 - [x] `turboquant_search_within()` — radius (WITHIN) / top-k+eps fused search
+- [x] IVF v2 single-file layout + k-means++ + parallel build
+- [x] Process-wide index cache
+- [x] Rerank (`keep_raw` + `rerank_factor`) — recall to ~exact
+- [x] Ensemble indexes — recall knob without native 8-bit
 - [x] macOS ARM + Linux x86_64 + Windows x86_64 CI
 - [x] Integration test suite (26 tests)
-- [ ] DuckDB Community Extension submission
+- [ ] DuckDB Community Extension submission (PR #3623 open, CI green)
 
 ## Known Limitations
 
