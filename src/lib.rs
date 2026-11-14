@@ -805,7 +805,10 @@ impl VTab for IvfSearchVTab {
                 (ci, l2_dist(&query, c))
             })
             .collect();
-        centroid_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // total_cmp: quantized scores can contain NaN (e.g. degenerate
+        // Lloyd-Max centroid fits); partial_cmp().unwrap() panics there and
+        // aborts the whole DuckDB process (smallsort non-unwinding panic).
+        centroid_dists.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         // Search top probes clusters
         let mut all: Vec<(i32, f32)> = Vec::new();
@@ -828,7 +831,8 @@ impl VTab for IvfSearchVTab {
         }
 
         // Sort and take top-k
-        all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // Sort and take top-k (total_cmp: NaN-safe, see note above)
+        all.sort_by(|a, b| b.1.total_cmp(&a.1));
         all.truncate(k);
 
         let schema = Arc::new(Schema::new(vec![
@@ -1216,7 +1220,7 @@ impl VTab for TurboQuantSearchWithinVTab {
                     results.push((sr.indices[j] as i32, sr.scores[j]));
                 }
             }
-            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| b.1.total_cmp(&a.1));
             if k > 0 {
                 results.truncate(k);
             }

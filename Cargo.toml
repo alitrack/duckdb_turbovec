@@ -21,7 +21,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] }
-turbovec = "0.9"
+turbovec = "1.1"
 arrow = "58"
 
 [build-dependencies]
