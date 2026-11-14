@@ -9,6 +9,7 @@ use duckdb::{
     Connection, Result,
 };
 use std::{error::Error, sync::Arc};
+use rayon::prelude::*;
 use turbovec::TurboQuantIndex;
 
 // ── turboquant_search(index_path, query_str, k) ──
@@ -560,7 +561,142 @@ impl IvfMeta {
     }
 }
 
-/// K-means clustering (Lloyd's algorithm)
+/// IVF v2 meta: single IdMapIndex (`index.tv`) with vectors stored in
+/// CLUSTER-CONTIGUOUS slot order — cluster ci occupies slots
+/// [cluster_offsets[ci], cluster_offsets[ci+1]). One rotation matrix and
+/// codebook for the whole IVF index (the v1 per-cluster-files layout paid
+/// ~1.6 MB of fixed overhead per cluster: 32 clusters on 1.5k docs = 19×
+/// the flat index size; 316 clusters on 100k = 0.6 GB vs 77 MB flat).
+struct IvfMetaV2 {
+    dim: usize,
+    bit_width: usize,
+    num_lists: usize,
+    centroids: Vec<f32>,       // flat: num_lists * dim
+    cluster_offsets: Vec<u32>, // num_lists + 1; slot ranges per cluster
+    slot_to_id: Vec<i32>,      // slot → original row id
+}
+
+impl IvfMetaV2 {
+    fn write(&self, path: &str) -> std::result::Result<(), Box<dyn Error>> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(b"TIVF2\0")?;
+        f.write_all(&(self.dim as u64).to_le_bytes())?;
+        f.write_all(&(self.bit_width as u64).to_le_bytes())?;
+        f.write_all(&(self.num_lists as u64).to_le_bytes())?;
+        f.write_all(&(self.cluster_offsets.len() as u64).to_le_bytes())?;
+        f.write_all(&(self.slot_to_id.len() as u64).to_le_bytes())?;
+        for c in &self.centroids {
+            f.write_all(&c.to_le_bytes())?;
+        }
+        for o in &self.cluster_offsets {
+            f.write_all(&o.to_le_bytes())?;
+        }
+        for id in &self.slot_to_id {
+            f.write_all(&id.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn load(path: &str) -> std::result::Result<Self, Box<dyn Error>> {
+        let data = std::fs::read(path)?;
+        if data.len() < 6 + 5 * 8 || &data[0..6] != b"TIVF2\0" {
+            return Err("not an IVF v2 meta file (missing TIVF2 magic)".into());
+        }
+        let mut off = 6;
+        let rd_u64 = |off: &mut usize| -> u64 {
+            let v = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
+            *off += 8;
+            v
+        };
+        let dim = rd_u64(&mut off) as usize;
+        let bit_width = rd_u64(&mut off) as usize;
+        let num_lists = rd_u64(&mut off) as usize;
+        let n_off = rd_u64(&mut off) as usize;
+        let n_ids = rd_u64(&mut off) as usize;
+        let centroids: Vec<f32> = data[off..off + num_lists * dim * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        off += num_lists * dim * 4;
+        let cluster_offsets: Vec<u32> = data[off..off + n_off * 4]
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        off += n_off * 4;
+        let slot_to_id: Vec<i32> = data[off..off + n_ids * 4]
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        if centroids.len() != num_lists * dim || cluster_offsets.len() != num_lists + 1 {
+            return Err("corrupt IVF v2 meta: section size mismatch".into());
+        }
+        Ok(Self { dim, bit_width, num_lists, centroids, cluster_offsets, slot_to_id })
+    }
+}
+
+/// K-means++ seeding: pick the first centroid at random, then each next
+/// centroid with probability proportional to the squared distance to the
+/// nearest already-picked centroid. Far better cluster separation than the
+/// old "first k evenly-spaced vectors" init, which could seed near-duplicate
+/// centroids and produce empty/skewed clusters (lower IVF recall).
+///
+/// Seeding runs on a random SAMPLE (`sample_cap`) when n is large: the
+/// full-population roulette is O(n·k·dim), which at 100k×316×1536 adds
+/// minutes for no measurable quality gain over a 10k sample.
+fn kmeans_pp_init(vectors: &[f32], dim: usize, k: usize, rng: &mut impl FnMut() -> usize) -> Vec<f32> {
+    const SAMPLE_CAP: usize = 10_000;
+    let n = vectors.len() / dim;
+    let sample: Vec<usize> = if n <= SAMPLE_CAP {
+        (0..n).collect()
+    } else {
+        // deterministic stride sample (reproducible builds)
+        let stride = n / SAMPLE_CAP;
+        (0..SAMPLE_CAP).map(|i| i * stride).collect()
+    };
+    let sn = sample.len();
+
+    let mut centroids = vec![0.0f32; k * dim];
+    let first = sample[rng() % sn];
+    centroids[..dim].copy_from_slice(&vectors[first * dim..(first + 1) * dim]);
+
+    // dist[i] = squared L2 from SAMPLE vector i to its nearest chosen centroid
+    let mut dist: Vec<f32> = (0..sn)
+        .map(|i| {
+            let v = &vectors[sample[i] * dim..(sample[i] + 1) * dim];
+            let c = &centroids[0..dim];
+            let d = l2_dist(v, c);
+            d * d
+        })
+        .collect();
+
+    for ci in 1..k {
+        let total: f32 = dist.iter().sum();
+        let mut pick = if total > 0.0 { (rng() as f32 / usize::MAX as f32) * total } else { 0.0 };
+        let mut chosen = sn - 1;
+        for (i, &d) in dist.iter().enumerate() {
+            pick -= d;
+            if pick <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        let vi = sample[chosen];
+        centroids[ci * dim..(ci + 1) * dim].copy_from_slice(&vectors[vi * dim..(vi + 1) * dim]);
+        let c = &centroids[ci * dim..(ci + 1) * dim];
+        for i in 0..sn {
+            let v = &vectors[sample[i] * dim..(sample[i] + 1) * dim];
+            let nd = l2_dist(v, c);
+            let nd2 = nd * nd;
+            if nd2 < dist[i] {
+                dist[i] = nd2;
+            }
+        }
+    }
+    centroids
+}
+
+/// K-means clustering (Lloyd's algorithm) with k-means++ seeding
 fn kmeans(
     vectors: &[f32], dim: usize, k: usize, max_iters: usize,
 ) -> (Vec<f32>, Vec<usize>) {
@@ -568,34 +704,42 @@ fn kmeans(
     let mut centroids = vec![0.0f32; k * dim];
     let mut assignments = vec![0usize; n];
 
-    // Init: pick first k vectors as centroids
-    let step = (n / k).max(1);
-    for ci in 0..k {
-        let vi = (ci * step).min(n - 1);
-        centroids[ci * dim..(ci + 1) * dim]
-            .copy_from_slice(&vectors[vi * dim..(vi + 1) * dim]);
-    }
+    // Seed with k-means++ (deterministic PRNG so builds are reproducible)
+    let mut seed: u64 = 0x9E3779B97F4A7C15;
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as usize
+    };
+    centroids = kmeans_pp_init(vectors, dim, k, &mut rng);
 
     for _iter in 0..max_iters {
-        // Assign each vector to nearest centroid
-        let mut changed = false;
-        for vi in 0..n {
-            let v = &vectors[vi * dim..(vi + 1) * dim];
-            let mut best_c = assignments[vi];
-            let mut best_d = l2_dist(v, &centroids[best_c * dim..(best_c + 1) * dim]);
-            for ci in 0..k {
-                let d = l2_dist(v, &centroids[ci * dim..(ci + 1) * dim]);
-                if d < best_d {
-                    best_d = d;
-                    best_c = ci;
+        // Assign each vector to nearest centroid (parallel across vectors;
+        // this O(n·k·dim) loop dominates build time at scale)
+        let new_assignments: Vec<usize> = (0..n)
+            .into_par_iter()
+            .map(|vi| {
+                let v = &vectors[vi * dim..(vi + 1) * dim];
+                let mut best_c = 0usize;
+                let mut best_d = l2_dist(v, &centroids[0..dim]);
+                for ci in 1..k {
+                    let d = l2_dist(v, &centroids[ci * dim..(ci + 1) * dim]);
+                    if d < best_d {
+                        best_d = d;
+                        best_c = ci;
+                    }
                 }
-            }
-            if best_c != assignments[vi] {
-                changed = true;
-                assignments[vi] = best_c;
-            }
-        }
-        if !changed { break; }
+                best_c
+            })
+            .collect();
+        let changed_any = new_assignments
+            .iter()
+            .zip(assignments.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assignments.copy_from_slice(&new_assignments);
+        if changed_any == 0 { break; }
 
         // Recompute centroids
         let mut counts = vec![0usize; k];
@@ -665,7 +809,6 @@ impl VTab for IvfBuildVTab {
         let vectors_str = bind.get_parameter(0).to_string();
         let dim: usize = bind.get_parameter(1).to_string().parse()?;
         let bw: usize = bind.get_parameter(2).to_string().parse()?;
-        let num_lists: usize = bind.get_parameter(3).to_string().parse()?;
         let output_dir = bind.get_parameter(4).to_string();
 
         let vectors = parse_nested_float_arrays(&vectors_str, dim)?;
@@ -673,43 +816,74 @@ impl VTab for IvfBuildVTab {
         if n == 0 {
             return Err("turboquant_build_ivf: no vectors provided".into());
         }
-        let lists = num_lists.min(n);
+        // num_lists = 0 → auto: sqrt(n) heuristic (DuckIR-style default; keeps
+        // per-cluster index count from exploding on small datasets where each
+        // .tv file carries ~1.6 MB of fixed overhead: rotation matrix +
+        // codebook. 32 clusters on 1.5k docs = 19× the flat index size).
+        let num_lists_param: i64 = bind.get_parameter(3).to_string().parse()?;
+        let lists = if num_lists_param == 0 {
+            ((n as f64).sqrt().round() as usize).max(1)
+        } else {
+            (num_lists_param as usize).min(n)
+        };
         if lists < 1 {
-            return Err("turboquant_build_ivf: num_lists must be >= 1".into());
+            return Err("turboquant_build_ivf: num_lists must be >= 0 (0 = auto sqrt(n))".into());
         }
 
         // K-means clustering
         let (centroids, assignments) = kmeans(&vectors, dim, lists, 20);
 
-        // Build per-cluster indices and id-maps (global → cluster-local)
-        let mut cluster_vecs: Vec<Vec<f32>> = vec![Vec::new(); lists];
-        let mut id_maps: Vec<Vec<i32>> = vec![Vec::new(); lists];
+        // V2 layout: count cluster sizes, compute slot offsets, then gather
+        // vectors cluster-contiguously into ONE IdMapIndex (id = original
+        // row) — a single rotation matrix/codebook instead of `lists` copies.
+        let mut counts = vec![0u32; lists];
+        for &c in &assignments {
+            counts[c] += 1;
+        }
+        let mut cluster_offsets = Vec::with_capacity(lists + 1);
+        let mut acc = 0u32;
+        cluster_offsets.push(0);
+        for &c in &counts {
+            acc += c;
+            cluster_offsets.push(acc);
+        }
+        // next_slot[ci] = write cursor within cluster ci's slot range
+        let mut next_slot = cluster_offsets[..lists].to_vec();
+        let mut gathered = vec![0.0f32; n * dim];
+        let mut slot_to_id = vec![0i32; n];
         for vi in 0..n {
             let c = assignments[vi];
-            id_maps[c].push(vi as i32);
-            cluster_vecs[c].extend_from_slice(&vectors[vi * dim..(vi + 1) * dim]);
+            let slot = next_slot[c] as usize;
+            next_slot[c] += 1;
+            gathered[slot * dim..(slot + 1) * dim]
+                .copy_from_slice(&vectors[vi * dim..(vi + 1) * dim]);
+            slot_to_id[slot] = vi as i32;
         }
 
         std::fs::create_dir_all(&output_dir)?;
-        for ci in 0..lists {
-            if cluster_vecs[ci].is_empty() { continue; }
-            let mut idx = TurboQuantIndex::new(dim, bw)
-                .map_err(|e| format!("turboquant_build_ivf cluster {ci}: {e}"))?;
-            idx.add(&cluster_vecs[ci]);
-            idx.write(&format!("{}/cluster_{ci}.tv", output_dir))
-                .map_err(|e| format!("turboquant_build_ivf write {ci}: {e}"))?;
+        // IdMapIndex wants u64 ids; slot_to_id is the id source, and since
+        // ids here are dense row numbers we can use slot==id mapping directly
+        // via ids = gathered order (id = slot_to_id[slot]).
+        let ids: Vec<u64> = slot_to_id.iter().map(|&v| v as u64).collect();
+        let mut idmap_index = turbovec::IdMapIndex::new(dim, bw)
+            .map_err(|e| format!("turboquant_build_ivf: idmap index: {e}"))?;
+        idmap_index
+            .add_with_ids(&gathered, &ids)
+            .map_err(|e| format!("turboquant_build_ivf: add_with_ids: {e}"))?;
+        idmap_index
+            .write(&format!("{output_dir}/index.tv"))
+            .map_err(|e| format!("turboquant_build_ivf: write index: {e}"))?;
 
-            // Write idmap: local_pos → global_idx
-            let idmap_path = format!("{}/idmap_{ci}.bin", output_dir);
-            let bytes: Vec<u8> = id_maps[ci].iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            std::fs::write(&idmap_path, bytes)?;
-        }
-
-        // Write meta
-        let meta = IvfMeta { dim, bit_width: bw, num_lists: lists, centroids };
-        meta.write(&format!("{}/meta.bin", output_dir))?;
+        // Write v2 meta (also covers empty clusters: zero-width ranges)
+        let meta = IvfMetaV2 {
+            dim,
+            bit_width: bw,
+            num_lists: lists,
+            centroids,
+            cluster_offsets,
+            slot_to_id,
+        };
+        meta.write(&format!("{output_dir}/meta2.bin"))?;
 
         bind.add_result_column("output_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("rows", LogicalTypeHandle::from(LogicalTypeId::Integer));
@@ -789,48 +963,84 @@ impl VTab for IvfSearchVTab {
         let k: usize = bind.get_parameter(2).to_string().parse()?;
         let probes: usize = bind.get_parameter(3).to_string().parse()?;
 
-        let meta = IvfMeta::load(&format!("{}/meta.bin", dir))?;
-        let dim = meta.dim;
-        // probes=0 or probes=-1 → auto: scan all clusters (guaranteed recall)
-        let probes = if probes == 0 || probes == usize::MAX {
-            meta.num_lists
-        } else {
-            probes.min(meta.num_lists)
-        };
+        // V2 single-index layout takes priority; fall back to v1 per-cluster
+        // files for indexes built before this version.
+        let meta2_path = format!("{dir}/meta2.bin");
+        let mut all: Vec<(i32, f32)> = if std::path::Path::new(&meta2_path).exists() {
+            let meta = IvfMetaV2::load(&meta2_path)?;
+            let dim = meta.dim;
+            let probes = probes.min(meta.num_lists);
 
-        // Find nearest centroids
-        let mut centroid_dists: Vec<(usize, f32)> = (0..meta.num_lists)
-            .map(|ci| {
-                let c = &meta.centroids[ci * dim..(ci + 1) * dim];
-                (ci, l2_dist(&query, c))
-            })
-            .collect();
-        // total_cmp: quantized scores can contain NaN (e.g. degenerate
-        // Lloyd-Max centroid fits); partial_cmp().unwrap() panics there and
-        // aborts the whole DuckDB process (smallsort non-unwinding panic).
-        centroid_dists.sort_by(|a, b| a.1.total_cmp(&b.1));
+            // rank centroids by L2 to the query
+            let mut centroid_dists: Vec<(usize, f32)> = (0..meta.num_lists)
+                .map(|ci| {
+                    let c = &meta.centroids[ci * dim..(ci + 1) * dim];
+                    (ci, l2_dist(&query, c))
+                })
+                .collect();
+            centroid_dists.sort_by(|a, b| a.1.total_cmp(&b.1));
 
-        // Search top probes clusters
-        let mut all: Vec<(i32, f32)> = Vec::new();
-        for (ci, _) in centroid_dists.iter().take(probes) {
-            let path = format!("{}/cluster_{ci}.tv", dir);
-            if let Ok(idx) = TurboQuantIndex::load(&path) {
-                let n = idx.len();
-                if n == 0 { continue; }
-
-                // Load idmap: local_pos → global_idx
-                let idmap = load_idmap(&format!("{}/idmap_{ci}.bin", dir));
-
-                let sr = idx.search(&query, k.min(n));
-                for j in 0..k.min(n) {
-                    let local = sr.indices[j] as usize;
-                    let global = if local < idmap.len() { idmap[local] } else { local as i32 };
-                    all.push((global, sr.scores[j]));
+            // allowlist = external ids in the probed clusters' slot ranges
+            let mut allowed: Vec<u64> = Vec::new();
+            for &(ci, _) in centroid_dists.iter().take(probes) {
+                let (s, e) = (meta.cluster_offsets[ci] as usize, meta.cluster_offsets[ci + 1] as usize);
+                for slot in s..e {
+                    allowed.push(meta.slot_to_id[slot] as u64);
                 }
             }
-        }
+            if allowed.is_empty() {
+                return Ok(IvfSearchBindData { results: Vec::new(), schema: Arc::new(Schema::new(vec![
+                    Field::new("idx", DataType::Int32, false),
+                    Field::new("score", DataType::Float32, false),
+                ])) });
+            }
 
-        // Sort and take top-k
+            let idx = turbovec::IdMapIndex::load(format!("{dir}/index.tv"))
+                .map_err(|e| format!("turboquant_search_ivf: {e}"))?;
+            let (scores, ids) = idx
+                .search_with_allowlist(&query, k, Some(&allowed))
+                .map_err(|e| format!("turboquant_search_ivf: {e}"))?;
+            ids.iter().zip(scores.iter())
+                .map(|(&id, &s)| (id as i32, s))
+                .collect()
+        } else {
+            // legacy v1 path
+            let meta = IvfMeta::load(&format!("{dir}/meta.bin"))?;
+            let dim = meta.dim;
+            let probes = if probes == 0 || probes == usize::MAX {
+                meta.num_lists
+            } else {
+                probes.min(meta.num_lists)
+            };
+
+            let mut centroid_dists: Vec<(usize, f32)> = (0..meta.num_lists)
+                .map(|ci| {
+                    let c = &meta.centroids[ci * dim..(ci + 1) * dim];
+                    (ci, l2_dist(&query, c))
+                })
+                .collect();
+            centroid_dists.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+            let mut all: Vec<(i32, f32)> = Vec::new();
+            for (ci, _) in centroid_dists.iter().take(probes) {
+                let path = format!("{dir}/cluster_{ci}.tv");
+                if let Ok(idx) = TurboQuantIndex::load(&path) {
+                    let n = idx.len();
+                    if n == 0 { continue; }
+                    let idmap = load_idmap(&format!("{dir}/idmap_{ci}.bin"));
+                    let sr = idx.search(&query, k.min(n));
+                    for j in 0..k.min(n) {
+                        let local = sr.indices[j] as usize;
+                        let global = if local < idmap.len() { idmap[local] } else { local as i32 };
+                        all.push((global, sr.scores[j]));
+                    }
+                }
+            }
+            all.sort_by(|a, b| b.1.total_cmp(&a.1));
+            all.truncate(k);
+            all
+        };
+
         // Sort and take top-k (total_cmp: NaN-safe, see note above)
         all.sort_by(|a, b| b.1.total_cmp(&a.1));
         all.truncate(k);

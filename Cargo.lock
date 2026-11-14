@@ -679,6 +679,7 @@ dependencies = [
  "arrow",
  "cc",
  "duckdb",
+ "rayon",
  "turbovec",
 ]
 
