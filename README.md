@@ -85,6 +85,7 @@ SELECT * FROM turboquant_search_within('/tmp/myidx.tv', '[0.1, 0.2, ...]', 0.05,
 | `turboquant_search(index_path, query_str, k)` | .tv file path, query `[f1,f2,...]`, top-k | (idx, score) |
 | `turboquant_search_within(index_path, query_str, eps, k)` | .tv file path, query `[f1,f2,...]`, score-epsilon, cap (0=none) | (idx, score) — all within `eps` of nearest, best-first; k>0 = top-k+radius fused |
 | `turboquant_search_ivf(index_dir, query_str, k, probes, [rerank_factor])` | IVF dir path, query string, top-k, probes (0=all), oversampling factor | (idx, score) |
+| `turboquant_search_ivf_filter(index_dir, query_str, k, filter_ids, [max_probes], [rerank_factor])` | IVF dir path (V2), query string, top-k, `LIST<BIGINT>` of ids passing an arbitrary SQL predicate, probe cap (0=auto-widen), rerank factor | (idx, score) — filtered vector search with iterative probe widening |
 | `turboquant_build_ensemble(vectors_str, dim, bit_width, members, output_dir)` | nested array string, dim, 2/3/4, m (1–8), dir | (output_dir, rows, members) |
 | `turboquant_search_ensemble(ensemble_dir, query_str, k)` | ensemble dir path, query string, top-k | (idx, score) — score-averaged across members |
 | `turboquant_score(index_path, query_str)` | .tv file path, query `[f1,f2,...]` | (idx, score) — all vectors, sorted DESC |
@@ -150,6 +151,7 @@ Requires DuckDB CLI and `turbovec.duckdb_extension` built in the project root.
 - [x] Process-wide index cache
 - [x] Rerank (`keep_raw` + `rerank_factor`) — recall to ~exact
 - [x] Ensemble indexes — recall knob without native 8-bit
+- [x] Filtered vector search (`turboquant_search_ivf_filter`) — arbitrary SQL predicates as a `LIST<BIGINT>` allowlist, iterative probe widening (pgvector 0.8 iterative-scan semantics, minus the HNSW filtered-recall pathology), optional rerank
 - [x] macOS ARM + Linux x86_64 + Windows x86_64 CI
 - [x] Integration test suite (26 tests)
 - [ ] DuckDB Community Extension submission (PR #3623 open, CI green)

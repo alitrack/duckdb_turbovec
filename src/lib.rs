@@ -1241,6 +1241,228 @@ impl VTab for IvfSearchVTab {
     }
 }
 
+// ── turboquant_search_ivf_filter(index_dir, query, k, filter_ids LIST<BIGINT>) ──
+// ── optional: max_probes INTEGER, rerank_factor INTEGER ──
+//
+// Filtered vector search: the caller supplies the set of external ids that
+// pass an arbitrary SQL predicate (e.g. `list_contains(genres,'Comedy')`).
+// The filter is applied as an allowlist on the quantized index — the same
+// `search_with_allowlist` hook rerank uses — so the IVF clusters are probed
+// by centroid distance as usual, but only surviving candidates are scored.
+//
+// Iterative probing (the pgvector 0.8 `strict_order` idea, minus the HNSW
+// pathology): start with `initial_probes` clusters; if fewer than k
+// filtered candidates were covered, keep widening along the centroid-
+// distance ranking until enough candidates are seen or all clusters are
+// probed. On IVF the widening is graceful (cluster granules), not a graph
+// re-entry like HNSW — the architecture gap we benchmarked on pgvector
+// (recall 0.26-0.40 @ 0.1% selectivity, slower than exact scan) does not
+// apply here because the allowlist bounds the search space directly.
+pub struct IvfFilterSearchVTab;
+
+#[repr(C)]
+pub struct IvfFilterSearchInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+pub struct IvfFilterSearchBindData {
+    results: Vec<(i32, f32)>,
+    schema: Arc<arrow::datatypes::Schema>,
+}
+
+impl VTab for IvfFilterSearchVTab {
+    type BindData = IvfFilterSearchBindData;
+    type InitData = IvfFilterSearchInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let pc = bind.get_parameter_count();
+        if pc < 4 {
+            return Err(
+                "turboquant_search_ivf_filter: expected 4 params (index_dir, query_str, k, filter_ids LIST<BIGINT>); optional: max_probes, rerank_factor"
+                    .into(),
+            );
+        }
+        let dir = bind.get_parameter(0).to_string();
+        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
+        let k: usize = bind.get_parameter(2).to_string().parse()?;
+        let filter_val = bind.get_parameter(3);
+        let mut filter_ids: Vec<u64> = filter_val
+            .to_list()
+            .ok_or_else(|| {
+                "turboquant_search_ivf_filter: filter_ids must be a LIST<BIGINT> (e.g. SELECT list(id) FROM t WHERE ...)"
+                    .to_string()
+            })?
+            .iter()
+            .map(|v| v.to_uint64())
+            .collect();
+        if filter_ids.is_empty() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("idx", DataType::Int32, false),
+                Field::new("score", DataType::Float32, false),
+            ]));
+            bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+            bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
+            return Ok(IvfFilterSearchBindData { results: Vec::new(), schema });
+        }
+        filter_ids.sort_unstable();
+        filter_ids.dedup();
+        let max_probes: usize = if pc >= 5 {
+            let mp: usize = bind.get_parameter(4).to_string().parse().unwrap_or(0);
+            if mp == 0 { usize::MAX } else { mp }
+        } else { usize::MAX };
+        let rerank_factor: usize = if pc >= 6 {
+            bind.get_parameter(5).to_string().parse().unwrap_or(0)
+        } else { 0 };
+
+        // V2 single-index layout only (v1 legacy has no slot table to intersect)
+        let meta2_path = format!("{dir}/meta2.bin");
+        if !std::path::Path::new(&meta2_path).exists() {
+            return Err(
+                "turboquant_search_ivf_filter: requires a V2 IVF index (meta2.bin); rebuild with current turboquant_build_ivf"
+                    .into(),
+            );
+        }
+        let meta = IvfMetaV2::load(&meta2_path)?;
+        let dim = meta.dim;
+        if query.len() != dim {
+            return Err(format!(
+                "turboquant_search_ivf_filter: query dim {} != index dim {dim}",
+                query.len()
+            )
+            .into());
+        }
+
+        // rank centroids by L2 to the query (probe order)
+        let mut centroid_dists: Vec<(usize, f32)> = (0..meta.num_lists)
+            .map(|ci| {
+                let c = &meta.centroids[ci * dim..(ci + 1) * dim];
+                (ci, l2_dist(&query, c))
+            })
+            .collect();
+        centroid_dists.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+        // filter set as sorted Vec (binary search membership) + per-cluster
+        // precomputed filtered-slot counts → iterative widening knows when to stop
+        let filter_set: &Vec<u64> = &filter_ids;
+        let cluster_filtered_count: Vec<usize> = (0..meta.num_lists)
+            .map(|ci| {
+                let (s, e) = (meta.cluster_offsets[ci] as usize, meta.cluster_offsets[ci + 1] as usize);
+                meta.slot_to_id[s..e]
+                    .iter()
+                    .filter(|&&id| filter_set.binary_search(&(id as u64)).is_ok())
+                    .count()
+            })
+            .collect();
+        let total_filtered: usize = cluster_filtered_count.iter().sum();
+
+        let idx = idmap_cache::get_or_load(&format!("{dir}/index.tv"))
+            .map_err(|e| format!("turboquant_search_ivf_filter: {e}"))?;
+
+        // allowlist = external ids of probed clusters ∩ filter set
+        let mut allowed: Vec<u64> = Vec::new();
+        let mut covered: usize = 0;
+        let mut probes_used = 0usize;
+        let want = (k * rerank_factor.max(1)).min(total_filtered);
+        for &(ci, _) in centroid_dists.iter() {
+            if probes_used >= max_probes { break; }
+            if covered >= want { break; }
+            let (s, e) = (meta.cluster_offsets[ci] as usize, meta.cluster_offsets[ci + 1] as usize);
+            for slot in s..e {
+                let id = meta.slot_to_id[slot] as u64;
+                if filter_set.binary_search(&id).is_ok() {
+                    allowed.push(id);
+                }
+            }
+            covered += cluster_filtered_count[ci];
+            probes_used += 1;
+        }
+
+        if allowed.is_empty() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("idx", DataType::Int32, false),
+                Field::new("score", DataType::Float32, false),
+            ]));
+            bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+            bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
+            return Ok(IvfFilterSearchBindData { results: Vec::new(), schema });
+        }
+
+        // search the quantized index with the filtered allowlist
+        let fetch = (k * rerank_factor.max(1)).min(allowed.len());
+        let (scores, ids) = idx
+            .search_with_allowlist(&query, fetch, Some(&allowed))
+            .map_err(|e| format!("turboquant_search_ivf_filter: {e}"))?;
+
+        let mut all: Vec<(i32, f32)>;
+        if rerank_factor > 1 {
+            let raw_path = format!("{dir}/vectors.f32");
+            if std::path::Path::new(&raw_path).exists() {
+                let (rs, ri) = rerank_exact(&raw_path, &query, &ids, dim, k)?;
+                all = ri.iter().zip(rs.iter()).map(|(&id, &s)| (id as i32, s)).collect();
+            } else {
+                all = ids.iter().zip(scores.iter()).take(k).map(|(&id, &s)| (id as i32, s)).collect();
+            }
+        } else {
+            all = ids.iter().zip(scores.iter()).map(|(&id, &s)| (id as i32, s)).collect();
+        }
+        all.sort_by(|a, b| b.1.total_cmp(&a.1));
+        all.truncate(k);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("idx", DataType::Int32, false),
+            Field::new("score", DataType::Float32, false),
+        ]));
+        bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
+        Ok(IvfFilterSearchBindData { results: all, schema })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(IvfFilterSearchInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        let bind = func.get_bind_data();
+        let n = bind.results.len();
+        if n == 0 {
+            init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            output.set_len(0);
+            return Ok(());
+        }
+        let indices: Vec<i32> = bind.results.iter().map(|r| r.0).collect();
+        let scores: Vec<f32> = bind.results.iter().map(|r| r.1).collect();
+        let batch = RecordBatch::try_new(
+            bind.schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(indices)),
+                Arc::new(Float32Array::from(scores)),
+            ],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Bigint)), // filter_ids LIST<BIGINT>
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+}
+
 // ── turboquant_add(index_path, vectors_str, dim) ──
 // Load existing index, append vectors, write back.
 
@@ -1647,6 +1869,7 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_table_function::<TurboQuantRemoveVTab>("turboquant_remove")?;
     con.register_table_function::<IvfBuildVTab>("turboquant_build_ivf")?;
     con.register_table_function::<IvfSearchVTab>("turboquant_search_ivf")?;
+    con.register_table_function::<IvfFilterSearchVTab>("turboquant_search_ivf_filter")?;
     con.register_table_function::<EnsembleBuildVTab>("turboquant_build_ensemble")?;
     con.register_table_function::<EnsembleSearchVTab>("turboquant_search_ensemble")?;
     Ok(())
