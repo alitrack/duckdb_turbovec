@@ -39,6 +39,15 @@ SELECT * FROM turboquant_search('/tmp/myidx.tv', '[0.1, 0.2, ...]', 10);
 SELECT * FROM turboquant_search_ivf('/tmp/myivf/', '[0.1, 0.2, ...]', 10, 8);
 -- Loaded indexes are cached process-wide: repeated queries skip the
 -- file read (21x faster on a 100k-vector index).
+
+-- Recall recovery: ensemble of m permutation-decorrelated indexes,
+-- score-averaged at search time (no native 8-bit in the kernel; this
+-- trades m x memory for recall instead)
+SELECT * FROM turboquant_build_ensemble(
+  getvariable('vec_str'), 1536, 4, 4, '/tmp/myens/'
+);
+SELECT * FROM turboquant_search_ensemble('/tmp/myens/', '[0.1, ...]', 10);
+-- recall@10 on 1472x1536 OpenAI embeddings: single 0.888 -> m=4 0.939
 -- → (idx INT, score FLOAT) — top 10 nearest neighbors
 
 -- Full scoring — all vectors ranked by similarity
