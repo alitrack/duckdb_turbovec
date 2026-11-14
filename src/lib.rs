@@ -12,6 +12,102 @@ use std::{error::Error, sync::Arc};
 use rayon::prelude::*;
 use turbovec::TurboQuantIndex;
 
+// ── Process-wide index cache ─────────────────────────────────────────────
+// Loading an index file is expensive (an 82MB IVF v2 index at 100k vectors
+// cost ~34ms per query, 10x the search itself). DuckDB binds table functions
+// per query, so without a cache every search re-reads the file. The cache
+// keys on the canonical path; entries are Arc'd so concurrent queries share
+// one loaded index. TurboQuantIndex::search takes &self with internal
+// OnceLock caches, so sharing across threads is safe.
+//
+// Eviction: simple capacity cap (ENTRY_CAP) on a FIFO basis. moka/LRU would
+// add a dependency for little gain at these sizes; the common deployment has
+// a handful of hot indexes.
+mod idx_cache {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+
+    const ENTRY_CAP: usize = 8;
+
+    struct CacheState {
+        map: HashMap<String, Arc<TurboQuantIndex>>,
+        order: VecDeque<String>,
+    }
+
+    static CACHE: Mutex<Option<CacheState>> = Mutex::new(None);
+
+    pub fn get_or_load(path: &str) -> std::result::Result<Arc<TurboQuantIndex>, String> {
+        let canonical = std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string());
+
+        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let state = guard.get_or_insert_with(|| CacheState {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        });
+
+        if let Some(hit) = state.map.get(&canonical) {
+            return Ok(Arc::clone(hit));
+        }
+        let idx = TurboQuantIndex::load(&canonical)
+            .map_err(|e| format!("index cache load {path}: {e}"))?;
+        let idx = Arc::new(idx);
+        state.map.insert(canonical.clone(), Arc::clone(&idx));
+        state.order.push_back(canonical);
+        while state.order.len() > ENTRY_CAP {
+            if let Some(evict) = state.order.pop_front() {
+                state.map.remove(&evict);
+            }
+        }
+        Ok(idx)
+    }
+}
+
+// Same cache for IdMapIndex (IVF v2 single-file layout).
+mod idmap_cache {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+
+    const ENTRY_CAP: usize = 8;
+
+    struct CacheState {
+        map: HashMap<String, Arc<turbovec::IdMapIndex>>,
+        order: VecDeque<String>,
+    }
+
+    static CACHE: Mutex<Option<CacheState>> = Mutex::new(None);
+
+    pub fn get_or_load(path: &str) -> std::result::Result<Arc<turbovec::IdMapIndex>, String> {
+        let canonical = std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string());
+
+        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let state = guard.get_or_insert_with(|| CacheState {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        });
+
+        if let Some(hit) = state.map.get(&canonical) {
+            return Ok(Arc::clone(hit));
+        }
+        let idx = turbovec::IdMapIndex::load(&canonical)
+            .map_err(|e| format!("idmap cache load {path}: {e}"))?;
+        let idx = Arc::new(idx);
+        state.map.insert(canonical.clone(), Arc::clone(&idx));
+        state.order.push_back(canonical);
+        while state.order.len() > ENTRY_CAP {
+            if let Some(evict) = state.order.pop_front() {
+                state.map.remove(&evict);
+            }
+        }
+        Ok(idx)
+    }
+}
+
 // ── turboquant_search(index_path, query_str, k) ──
 
 #[repr(C)]
@@ -39,7 +135,7 @@ impl VTab for TurboQuantSearchVTab {
         let path = bind.get_parameter(0).to_string();
         let query = parse_float_array(&bind.get_parameter(1).to_string())?;
         let k: usize = bind.get_parameter(2).to_string().parse()?;
-        let idx = TurboQuantIndex::load(&path)
+        let idx = idx_cache::get_or_load(&path)
             .map_err(|e| format!("turboquant_search: {e}"))?;
         let n = idx.len();
         let k = k.min(n);  // clamp to index size
@@ -134,7 +230,7 @@ impl VTab for TurboQuantScoreVTab {
         let path = bind.get_parameter(0).to_string();
         let query = parse_float_array(&bind.get_parameter(1).to_string())?;
 
-        let idx = TurboQuantIndex::load(&path)
+        let idx = idx_cache::get_or_load(&path)
             .map_err(|e| format!("turboquant_score: {e}"))?;
         let n = idx.len();
         if n == 0 {
@@ -995,7 +1091,7 @@ impl VTab for IvfSearchVTab {
                 ])) });
             }
 
-            let idx = turbovec::IdMapIndex::load(format!("{dir}/index.tv"))
+            let idx = idmap_cache::get_or_load(&format!("{dir}/index.tv"))
                 .map_err(|e| format!("turboquant_search_ivf: {e}"))?;
             let (scores, ids) = idx
                 .search_with_allowlist(&query, k, Some(&allowed))
