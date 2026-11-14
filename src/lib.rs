@@ -172,7 +172,7 @@ impl VTab for TurboQuantSearchVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.results.len().min(2048);
+        let n = bind.results.len();
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
@@ -269,7 +269,7 @@ impl VTab for TurboQuantScoreVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.results.len().min(2048);
+        let n = bind.results.len();
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
@@ -1163,7 +1163,7 @@ impl VTab for IvfSearchVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.results.len().min(2048);
+        let n = bind.results.len();
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
@@ -1555,7 +1555,7 @@ impl VTab for TurboQuantSearchWithinVTab {
             return Ok(());
         }
         let bind = func.get_bind_data();
-        let n = bind.results.len().min(2048);
+        let n = bind.results.len();
         if n == 0 {
             init.done.store(true, std::sync::atomic::Ordering::Relaxed);
             output.set_len(0);
@@ -1599,5 +1599,279 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_table_function::<TurboQuantRemoveVTab>("turboquant_remove")?;
     con.register_table_function::<IvfBuildVTab>("turboquant_build_ivf")?;
     con.register_table_function::<IvfSearchVTab>("turboquant_search_ivf")?;
+    con.register_table_function::<EnsembleBuildVTab>("turboquant_build_ensemble")?;
+    con.register_table_function::<EnsembleSearchVTab>("turboquant_search_ensemble")?;
     Ok(())
+}
+
+// ── turboquant_build_ensemble(vectors_str, dim, bit_width, members, output_dir) ──
+// ── turboquant_search_ensemble(ensemble_dir, query_str, k) ──
+//
+// Recall recovery via ensembling: the kernel hard-caps bit_width at 2..=4,
+// so there is no native 8-bit. Instead, build `members` indexes over the
+// SAME vectors, each behind its own deterministic dimension permutation
+// (input-side decorrelation: the kernel's internal rotation seed is fixed
+// at 42, so permuting the input is the only way to de-correlate quantization
+// noise across members). Search runs every member and AVERAGES the scores
+// per vector id. Independent noise averages down ~1/sqrt(m): with 2 members
+// at 4-bit each, memory is the same as a hypothetical 8-bit index while
+// recall lands between 4-bit and exact.
+
+/// Deterministic seeded permutation (splitmix-style shuffle) of 0..dim.
+/// Same member index → same permutation on every build, so a rebuilt
+/// ensemble stays compatible with its meta.
+fn seeded_permutation(dim: usize, member: usize, seed: u64) -> Vec<usize> {
+    let mut perm: Vec<usize> = (0..dim).collect();
+    let mut s = seed ^ (member as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    for i in (1..dim).rev() {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        let j = (s as usize) % (i + 1);
+        perm.swap(i, j);
+    }
+    perm
+}
+
+pub struct EnsembleBuildVTab;
+
+#[repr(C)]
+pub struct EnsembleBuildInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+pub struct EnsembleBuildBindData {
+    output_dir: String,
+    rows: usize,
+    members: usize,
+}
+
+impl VTab for EnsembleBuildVTab {
+    type BindData = EnsembleBuildBindData;
+    type InitData = EnsembleBuildInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let vectors_str = bind.get_parameter(0).to_string();
+        let dim: usize = bind.get_parameter(1).to_string().parse()?;
+        let bw: usize = bind.get_parameter(2).to_string().parse()?;
+        let members: usize = bind.get_parameter(3).to_string().parse()?;
+        let output_dir = bind.get_parameter(4).to_string();
+
+        if !(2..=4).contains(&bw) {
+            return Err("turboquant_build_ensemble: bit_width must be 2, 3 or 4".into());
+        }
+        if members < 1 || members > 8 {
+            return Err("turboquant_build_ensemble: members must be 1..=8".into());
+        }
+
+        let vectors = parse_nested_float_arrays(&vectors_str, dim)?;
+        let n = vectors.len() / dim;
+        if n == 0 {
+            return Err("turboquant_build_ensemble: no vectors provided".into());
+        }
+
+        std::fs::create_dir_all(&output_dir)?;
+
+        // Per member: permute dims, build, write, record permutation.
+        // Permutations live in meta so search reproduces them exactly.
+        let mut perms: Vec<Vec<u32>> = Vec::with_capacity(members);
+        for m in 0..members {
+            let perm = seeded_permutation(dim, m, 0x524F54_41525A21); // "ROTARZ!"
+            let mut gathered = vec![0.0f32; n * dim];
+            for vi in 0..n {
+                for d in 0..dim {
+                    gathered[vi * dim + d] = vectors[vi * dim + perm[d]];
+                }
+            }
+            let mut idx = TurboQuantIndex::new(dim, bw)
+                .map_err(|e| format!("turboquant_build_ensemble member {m}: {e}"))?;
+            idx.add(&gathered);
+            idx.write(&format!("{output_dir}/member_{m}.tv"))
+                .map_err(|e| format!("turboquant_build_ensemble write {m}: {e}"))?;
+            perms.push(perm.iter().map(|&p| p as u32).collect());
+        }
+
+        // meta: magic, dim, bw, members, n, then each permutation
+        use std::io::Write;
+        let mut f = std::fs::File::create(format!("{output_dir}/ensemble.bin"))?;
+        f.write_all(b"TENS\0")?;
+        f.write_all(&(dim as u64).to_le_bytes())?;
+        f.write_all(&(bw as u64).to_le_bytes())?;
+        f.write_all(&(members as u64).to_le_bytes())?;
+        f.write_all(&(n as u64).to_le_bytes())?;
+        for perm in &perms {
+            for &p in perm {
+                f.write_all(&p.to_le_bytes())?;
+            }
+        }
+
+        bind.add_result_column("output_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("rows", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("members", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        Ok(EnsembleBuildBindData { output_dir, rows: n, members })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(EnsembleBuildInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bind = func.get_bind_data();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("output_dir", DataType::Utf8, false),
+            Field::new("rows", DataType::Int32, false),
+            Field::new("members", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(arrow::array::StringArray::from(vec![bind.output_dir.as_str()])),
+            Arc::new(Int32Array::from(vec![bind.rows as i32])),
+            Arc::new(Int32Array::from(vec![bind.members as i32])),
+        ])?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        ])
+    }
+}
+
+pub struct EnsembleSearchVTab;
+
+#[repr(C)]
+pub struct EnsembleSearchInitData {
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[repr(C)]
+pub struct EnsembleSearchBindData {
+    results: Vec<(i32, f32)>,
+    schema: Arc<arrow::datatypes::Schema>,
+}
+
+impl VTab for EnsembleSearchVTab {
+    type BindData = EnsembleSearchBindData;
+    type InitData = EnsembleSearchInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let dir = bind.get_parameter(0).to_string();
+        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
+        let k: usize = bind.get_parameter(2).to_string().parse()?;
+
+        // load meta
+        let data = std::fs::read(format!("{dir}/ensemble.bin"))?;
+        if &data[0..5] != b"TENS\0" {
+            return Err("not an ensemble index (missing TENS magic)".into());
+        }
+        let dim = u64::from_le_bytes(data[5..13].try_into().unwrap()) as usize;
+        let members = u64::from_le_bytes(data[21..29].try_into().unwrap()) as usize;
+        let mut off = 29 + 8; // skip n
+        let perms: Vec<Vec<u32>> = (0..members)
+            .map(|m| {
+                let p: Vec<u32> = data[off + m * dim * 4..off + (m + 1) * dim * 4]
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                p
+            })
+            .collect();
+
+        // sum scores per id across members (ids are positional row numbers)
+        use std::collections::HashMap;
+        let mut score_sum: HashMap<i32, (f32, u32)> = HashMap::new();
+        for m in 0..members {
+            // apply this member's permutation to the query
+            let perm = &perms[m];
+            let mut pq = vec![0.0f32; dim];
+            for d in 0..dim {
+                pq[d] = query[perm[d] as usize];
+            }
+            let idx = idx_cache::get_or_load(&format!("{dir}/member_{m}.tv"))?;
+            // Ask each member for MORE than k (k per member would truncate
+            // the union); fetch min(len, 4k) and let the fused ranking decide.
+            let want = (k * 4).min(idx.len()).max(k);
+            let sr = idx.search(&pq, want);
+            // SearchResults: scores/indices row-major; single query → one row
+            let n_res = sr.scores.len();
+            for j in 0..n_res {
+                let id = sr.indices[j];
+                let s = sr.scores[j];
+                let e = score_sum.entry(id as i32).or_insert((0.0, 0));
+                e.0 += s;
+                e.1 += 1;
+            }
+        }
+
+        let mut results: Vec<(i32, f32)> = score_sum
+            .into_iter()
+            .map(|(id, (s, cnt))| (id, s / cnt as f32))
+            .collect();
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
+        results.truncate(k);
+
+        bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("idx", DataType::Int32, false),
+            Field::new("score", DataType::Float32, false),
+        ]));
+        Ok(EnsembleSearchBindData { results, schema })
+    }
+
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(EnsembleSearchInitData { done: false.into() })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let init = func.get_init_data();
+        if init.done.load(std::sync::atomic::Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bind = func.get_bind_data();
+        let n = bind.results.len();
+        if n == 0 {
+            output.set_len(0);
+            return Ok(());
+        }
+        let indices: Vec<i32> = bind.results.iter().map(|r| r.0).collect();
+        let scores: Vec<f32> = bind.results.iter().map(|r| r.1).collect();
+        let batch = RecordBatch::try_new(
+            bind.schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(indices)),
+                Arc::new(Float32Array::from(scores)),
+            ],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        init.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
 }
