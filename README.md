@@ -27,12 +27,18 @@ SELECT * FROM turboquant_build_list(
 SELECT * FROM turboquant_build_ivf(
   getvariable('vec_str'), 1536, 4, 256, '/tmp/myivf/'
 );
+-- num_lists = 0 → auto (sqrt(n)). IVF v2 stores all clusters in ONE
+-- index file (index.tv + meta2.bin) instead of one .tv per cluster —
+-- 18x smaller at 1.5k docs, 7x at 100k. Old per-cluster indexes still
+-- searchable (format auto-detected).
 
 -- Top-k search
 SELECT * FROM turboquant_search('/tmp/myidx.tv', '[0.1, 0.2, ...]', 10);
 
 -- IVF search (with probe count)
 SELECT * FROM turboquant_search_ivf('/tmp/myivf/', '[0.1, 0.2, ...]', 10, 8);
+-- Loaded indexes are cached process-wide: repeated queries skip the
+-- file read (21x faster on a 100k-vector index).
 -- → (idx INT, score FLOAT) — top 10 nearest neighbors
 
 -- Full scoring — all vectors ranked by similarity
