@@ -174,7 +174,7 @@ echo "$OUT" | grep -q "12" && pass "IVF build 12 vectors" || fail "IVF build" "$
 # ── Test: IVF search ──
 SQL="
 LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
-SELECT COUNT(*) FROM turboquant_search_ivf('$IVF_DIR', '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]', 5, 3);
+SELECT COUNT(*) FROM turboquant_search_ivf('$IVF_DIR', '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]', 5, 3, 0);
 "
 OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
 echo "$OUT" | grep -q "5" && pass "IVF search top-5" || fail "IVF search" "$OUT"
@@ -182,7 +182,7 @@ echo "$OUT" | grep -q "5" && pass "IVF search top-5" || fail "IVF search" "$OUT"
 # ── Test: IVF auto-probe (probes=0 → full scan) ──
 SQL="
 LOAD '$PROJECT_DIR/turbovec.duckdb_extension';
-SELECT COUNT(*) FROM turboquant_search_ivf('$IVF_DIR', '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]', 5, 0);
+SELECT COUNT(*) FROM turboquant_search_ivf('$IVF_DIR', '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]', 5, 0, 0);
 "
 OUT=$($DUCKDB -noheader -c "$SQL" 2>&1)
 echo "$OUT" | grep -q "5" && pass "IVF auto-probe returns top-5" || fail "IVF auto-probe" "$OUT"

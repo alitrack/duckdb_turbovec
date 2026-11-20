@@ -236,10 +236,15 @@ impl VTab for TurboQuantScoreVTab {
             .map_err(|e| format!("turboquant_score: {e}"))?;
         let n = idx.len();
         if n == 0 {
+            // Empty index: zero rows, but the result columns must still be
+            // declared or DuckDB aborts with
+            // `INTERNAL Error: Table function must return at least one column`.
             let schema = Arc::new(Schema::new(vec![
                 Field::new("idx", DataType::Int32, false),
                 Field::new("score", DataType::Float32, false),
             ]));
+            bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+            bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
             return Ok(ScoreBindData { results: Vec::new(), schema });
         }
 
@@ -1090,7 +1095,16 @@ impl VTab for IvfSearchVTab {
         let mut all: Vec<(i32, f32)> = if std::path::Path::new(&meta2_path).exists() {
             let meta = IvfMetaV2::load(&meta2_path)?;
             let dim = meta.dim;
-            let probes = probes.min(meta.num_lists);
+            // probes == 0 / usize::MAX means "probe every cluster" — the v1
+            // path below has always honoured that, and the documented API says
+            // 0 = all. A plain `probes.min(num_lists)` turns 0 into 0 probed
+            // clusters, which silently returns nothing (and used to trip the
+            // "must return at least one column" assertion below).
+            let probes = if probes == 0 || probes == usize::MAX {
+                meta.num_lists
+            } else {
+                probes.min(meta.num_lists)
+            };
 
             // rank centroids by L2 to the query
             let mut centroid_dists: Vec<(usize, f32)> = (0..meta.num_lists)
@@ -1110,6 +1124,13 @@ impl VTab for IvfSearchVTab {
                 }
             }
             if allowed.is_empty() {
+                // No cluster survived the probe: return an EMPTY result set, but
+                // still declare the result columns. Returning a schema without
+                // registering the columns makes DuckDB abort with
+                // `INTERNAL Error: Table function must return at least one column`
+                // instead of yielding zero rows.
+                bind.add_result_column("idx", LogicalTypeHandle::from(LogicalTypeId::Integer));
+                bind.add_result_column("score", LogicalTypeHandle::from(LogicalTypeId::Float));
                 return Ok(IvfSearchBindData { results: Vec::new(), schema: Arc::new(Schema::new(vec![
                     Field::new("idx", DataType::Int32, false),
                     Field::new("score", DataType::Float32, false),
