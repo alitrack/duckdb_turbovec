@@ -134,9 +134,9 @@ impl VTab for TurboQuantSearchVTab {
         if pc < 3 {
             return Err("turboquant_search: expected 3 params (path, query_str, k)".into());
         }
-        let path = bind.get_parameter(0).to_string();
-        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
-        let k: usize = bind.get_parameter(2).to_string().parse()?;
+        let path = param_str(bind, 0)?;
+        let query = parse_float_array(&param_str(bind, 1)?)?;
+        let k: usize = param_str(bind, 2)?.parse()?;
         let idx = idx_cache::get_or_load(&path)
             .map_err(|e| format!("turboquant_search: {e}"))?;
         let n = idx.len();
@@ -229,8 +229,8 @@ impl VTab for TurboQuantScoreVTab {
         if pc < 2 {
             return Err("turboquant_score: expected 2 params (path, query_str)".into());
         }
-        let path = bind.get_parameter(0).to_string();
-        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
+        let path = param_str(bind, 0)?;
+        let query = parse_float_array(&param_str(bind, 1)?)?;
 
         let idx = idx_cache::get_or_load(&path)
             .map_err(|e| format!("turboquant_score: {e}"))?;
@@ -332,11 +332,11 @@ impl VTab for TurboQuantBuildVTab {
                     .into(),
             );
         }
-        let dim: usize = bind.get_parameter(1).to_string().parse()?;
-        let bw: usize = bind.get_parameter(2).to_string().parse()?;
-        let output_path = bind.get_parameter(3).to_string();
+        let dim: usize = param_str(bind, 1)?.parse()?;
+        let bw: usize = param_str(bind, 2)?.parse()?;
+        let output_path = param_str(bind, 3)?;
 
-        let vectors_str = bind.get_parameter(0).to_string();
+        let vectors_str = param_str(bind, 0)?;
         let vectors = parse_nested_float_arrays(&vectors_str, dim)?;
 
         let n = vectors.len() / dim;
@@ -398,6 +398,31 @@ impl VTab for TurboQuantBuildVTab {
 }
 
 // ── Utilities ──
+
+/// Read a VARCHAR bind parameter, rejecting SQL `NULL`.
+///
+/// `Value::to_string()` on a SQL `NULL` goes through `duckdb_get_varchar`, which
+/// throws a C++ exception; that exception unwinds across the `extern "C"`
+/// boundary and **aborts the whole DuckDB process** ("panic in a function that
+/// cannot unwind") instead of returning an error. A NULL here is a realistic
+/// call, not a hostile one: `turboquant_build(getvariable('v'), ...)` where the
+/// `SET VARIABLE` ran over an empty table produces NULL. Reject it as an
+/// ordinary bind error.
+fn param_str(
+    bind: &BindInfo,
+    idx: u64,
+) -> std::result::Result<String, Box<dyn Error>> {
+    let v = bind.get_parameter(idx);
+    if v.is_null() {
+        return Err(format!(
+            "parameter {} is NULL (expected a value — e.g. string_agg/getvariable over an \
+             empty table yields NULL); nothing to index",
+            idx + 1
+        )
+        .into());
+    }
+    Ok(v.to_string())
+}
 
 fn parse_float_array(raw: &str) -> std::result::Result<Vec<f32>, Box<dyn Error>> {
     let cleaned = raw.trim().trim_start_matches('[').trim_end_matches(']');
@@ -516,8 +541,8 @@ impl VTab for TurboQuantBuildListVTab {
             return Err("turboquant_build_list: empty vectors list".into());
         }
 
-        let bw: usize = bind.get_parameter(1).to_string().parse()?;
-        let output_path = bind.get_parameter(2).to_string();
+        let bw: usize = param_str(bind, 1)?.parse()?;
+        let output_path = param_str(bind, 2)?;
 
         // Auto-detect dim from the first few common dims that evenly divide total
         let dim = auto_detect_dim(floats.len())
@@ -909,10 +934,10 @@ impl VTab for IvfBuildVTab {
                     .into(),
             );
         }
-        let vectors_str = bind.get_parameter(0).to_string();
-        let dim: usize = bind.get_parameter(1).to_string().parse()?;
-        let bw: usize = bind.get_parameter(2).to_string().parse()?;
-        let output_dir = bind.get_parameter(4).to_string();
+        let vectors_str = param_str(bind, 0)?;
+        let dim: usize = param_str(bind, 1)?.parse()?;
+        let bw: usize = param_str(bind, 2)?.parse()?;
+        let output_dir = param_str(bind, 4)?;
 
         let vectors = parse_nested_float_arrays(&vectors_str, dim)?;
         let n = vectors.len() / dim;
@@ -923,7 +948,7 @@ impl VTab for IvfBuildVTab {
         // per-cluster index count from exploding on small datasets where each
         // .tv file carries ~1.6 MB of fixed overhead: rotation matrix +
         // codebook. 32 clusters on 1.5k docs = 19× the flat index size).
-        let num_lists_param: i64 = bind.get_parameter(3).to_string().parse()?;
+        let num_lists_param: i64 = param_str(bind, 3)?.parse()?;
         let lists = if num_lists_param == 0 {
             ((n as f64).sqrt().round() as usize).max(1)
         } else {
@@ -996,7 +1021,7 @@ impl VTab for IvfBuildVTab {
         // Cost: +4 bytes/dim/vector (a 1472×1536 index grows 3.0→12 MB).
         if pc >= 6 {
             // Boolean params arrive as "true"/"false" (not 1/0) via to_string()
-            let keep_raw_str = bind.get_parameter(5).to_string().to_lowercase();
+            let keep_raw_str = param_str(bind, 5)?.to_lowercase();
             let keep_raw = matches!(keep_raw_str.as_str(), "true" | "1" | "t" | "yes");
             if keep_raw {
                 // EXTERNAL id order (= input row order): rerank indexes the
@@ -1084,10 +1109,10 @@ impl VTab for IvfSearchVTab {
                     .into(),
             );
         }
-        let dir = bind.get_parameter(0).to_string();
-        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
-        let k: usize = bind.get_parameter(2).to_string().parse()?;
-        let probes: usize = bind.get_parameter(3).to_string().parse()?;
+        let dir = param_str(bind, 0)?;
+        let query = parse_float_array(&param_str(bind, 1)?)?;
+        let k: usize = param_str(bind, 2)?.parse()?;
+        let probes: usize = param_str(bind, 3)?.parse()?;
 
         // V2 single-index layout takes priority; fall back to v1 per-cluster
         // files for indexes built before this version.
@@ -1143,7 +1168,7 @@ impl VTab for IvfSearchVTab {
             // quantized index, then rescore exactly against raw f32 vectors
             // (vectors.f32, slot order) if present. factor=0 → plain path.
             let rerank_factor: usize = if pc >= 5 {
-                bind.get_parameter(4).to_string().parse().unwrap_or(0)
+                param_str(bind, 4)?.parse().unwrap_or(0)
             } else {
                 0
             };
@@ -1306,9 +1331,9 @@ impl VTab for IvfFilterSearchVTab {
                     .into(),
             );
         }
-        let dir = bind.get_parameter(0).to_string();
-        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
-        let k: usize = bind.get_parameter(2).to_string().parse()?;
+        let dir = param_str(bind, 0)?;
+        let query = parse_float_array(&param_str(bind, 1)?)?;
+        let k: usize = param_str(bind, 2)?.parse()?;
         let filter_val = bind.get_parameter(3);
         let mut filter_ids: Vec<u64> = filter_val
             .to_list()
@@ -1340,6 +1365,9 @@ impl VTab for IvfFilterSearchVTab {
         };
         let named_int = |bind: &BindInfo, name: &str| -> Option<i64> {
             bind.get_named_parameter(name)
+                // NULL must not reach to_string(): duckdb_get_varchar throws and
+                // the exception aborts the process (see `param_str`).
+                .filter(|v| !v.is_null())
                 .and_then(|v| v.to_string().parse::<i64>().ok())
         };
         let max_probes: usize = match named_int(bind, "max_probes") {
@@ -1538,9 +1566,9 @@ impl VTab for TurboQuantAddVTab {
                 "turboquant_add: expected 3 params (path, vectors_str, dim)".into(),
             );
         }
-        let path = bind.get_parameter(0).to_string();
-        let vectors_str = bind.get_parameter(1).to_string();
-        let dim: usize = bind.get_parameter(2).to_string().parse()?;
+        let path = param_str(bind, 0)?;
+        let vectors_str = param_str(bind, 1)?;
+        let dim: usize = param_str(bind, 2)?.parse()?;
 
         let vectors = parse_nested_float_arrays(&vectors_str, dim)?;
         let to_add = vectors.len() / dim;
@@ -1624,8 +1652,8 @@ impl VTab for TurboQuantRemoveVTab {
         if pc < 2 {
             return Err("turboquant_remove: expected 2 params (path, idx)".into());
         }
-        let path = bind.get_parameter(0).to_string();
-        let target: usize = bind.get_parameter(1).to_string().parse()?;
+        let path = param_str(bind, 0)?;
+        let target: usize = param_str(bind, 1)?.parse()?;
 
         let mut idx = TurboQuantIndex::load(&path)
             .map_err(|e| format!("turboquant_remove: load error: {e}"))?;
@@ -1711,10 +1739,10 @@ impl VTab for TurboQuantBuildConcatVTab {
                     .into(),
             );
         }
-        let output_path = bind.get_parameter(0).to_string();
-        let dim: usize = bind.get_parameter(1).to_string().parse()?;
-        let bw: usize = bind.get_parameter(2).to_string().parse()?;
-        let values_str = bind.get_parameter(3).to_string();
+        let output_path = param_str(bind, 0)?;
+        let dim: usize = param_str(bind, 1)?.parse()?;
+        let bw: usize = param_str(bind, 2)?.parse()?;
+        let values_str = param_str(bind, 3)?;
 
         // Parse flat comma-separated floats (NOT nested arrays)
         let all = parse_float_array(&format!("[{}]", values_str))?;
@@ -1810,16 +1838,12 @@ impl VTab for TurboQuantSearchWithinVTab {
                 "turboquant_search_within: expected 4 params (path, query_str, eps, k)".into(),
             );
         }
-        let path = bind.get_parameter(0).to_string();
-        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
-        let eps: f32 = bind
-            .get_parameter(2)
-            .to_string()
+        let path = param_str(bind, 0)?;
+        let query = parse_float_array(&param_str(bind, 1)?)?;
+        let eps: f32 = param_str(bind, 2)?
             .parse()
             .map_err(|_| "turboquant_search_within: eps must be a number")?;
-        let k: usize = bind
-            .get_parameter(3)
-            .to_string()
+        let k: usize = param_str(bind, 3)?
             .parse()
             .map_err(|_| "turboquant_search_within: k must be a non-negative integer")?;
 
@@ -2117,11 +2141,11 @@ impl VTab for EnsembleBuildVTab {
     type InitData = EnsembleBuildInitData;
 
     fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        let vectors_str = bind.get_parameter(0).to_string();
-        let dim: usize = bind.get_parameter(1).to_string().parse()?;
-        let bw: usize = bind.get_parameter(2).to_string().parse()?;
-        let members: usize = bind.get_parameter(3).to_string().parse()?;
-        let output_dir = bind.get_parameter(4).to_string();
+        let vectors_str = param_str(bind, 0)?;
+        let dim: usize = param_str(bind, 1)?.parse()?;
+        let bw: usize = param_str(bind, 2)?.parse()?;
+        let members: usize = param_str(bind, 3)?.parse()?;
+        let output_dir = param_str(bind, 4)?;
 
         if !(2..=4).contains(&bw) {
             return Err("turboquant_build_ensemble: bit_width must be 2, 3 or 4".into());
@@ -2235,9 +2259,9 @@ impl VTab for EnsembleSearchVTab {
     type InitData = EnsembleSearchInitData;
 
     fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
-        let dir = bind.get_parameter(0).to_string();
-        let query = parse_float_array(&bind.get_parameter(1).to_string())?;
-        let k: usize = bind.get_parameter(2).to_string().parse()?;
+        let dir = param_str(bind, 0)?;
+        let query = parse_float_array(&param_str(bind, 1)?)?;
+        let k: usize = param_str(bind, 2)?.parse()?;
 
         // load meta
         let data = std::fs::read(format!("{dir}/ensemble.bin"))?;
